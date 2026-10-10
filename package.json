@@ -1,0 +1,31 @@
+{
+  "name": "orvia",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Orvia v0.1 native-first multi-agent orchestration platform",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/api/server.ts",
+    "start": "node dist/api/server.js",
+    "web:dev": "pnpm --dir web dev",
+    "web:build": "pnpm --dir web build",
+    "web:start": "pnpm --dir web start",
+    "build": "pnpm build:api && pnpm web:build",
+    "build:api": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "seed": "tsx src/scripts/seed.ts",
+    "check": "pnpm typecheck && pnpm test && pnpm web:build"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "drizzle-orm": "^0.38.3",
+    "ioredis": "^6.0.0",
+    "mysql2": "^3.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
