@@ -2,12 +2,14 @@
 
 import { CSSProperties, FormEvent, memo, PointerEvent as ReactPointerEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { beijingClock } from '../lib/beijing-time';
+import { useAutoDismiss } from '../lib/use-auto-dismiss';
 
 type Id = number;
 export type BoardNode = { key: string; name: string; type: 'task' | 'checkpoint' | 'start' | 'end'; capabilities: string[]; question: string; instruction: string; outputRequirement: string; acceptanceRule: string; maxRedos: number; requirement: string; x: number; y: number; w: number; h: number };
 export type BoardLoop = { key: string; nodeKeys: string[]; maxIterations: number };
 export type BoardEdge = { source: string; target: string };
-export type NodeCheck = { verdict: 'pass' | 'reject' | 'unclear'; label: string; detail: string };
+export type NodeCheckEntry = { verdict: 'pass' | 'reject' | 'unclear'; label: string; detail: string; at?: string };
+export type NodeCheck = NodeCheckEntry & { history?: NodeCheckEntry[] };
 export type SummaryFile = { name: string; path: string };
 export type SummaryNode = { key: string; name: string; status: string; files: SummaryFile[] };
 type CapabilityRow = { id: Id; key: string; name: string; description?: string | null };
@@ -137,16 +139,27 @@ function rememberedLogLine(event: EventRow) {
 
 const LogText = memo(function LogText({ events }: { events: EventRow[] }) {
   const ref = useRef<HTMLPreElement>(null);
+  const stickBottom = useRef(true);
   const text = useMemo(() => {
     if (!events.length) return '';
     const start = Math.max(0, events.length - LOG_LIMIT);
     const body = events.slice(start).map(rememberedLogLine).join('\n');
     return start > 0 ? `较早的 ${start} 条已收起\n${body}` : body;
   }, [events]);
-  useEffect(() => {
-    if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
+  useLayoutEffect(() => {
+    const node = ref.current;
+    if (!node || !stickBottom.current) return;
+    node.scrollTop = node.scrollHeight;
   }, [text]);
-  return <pre className="log-view" ref={ref}>{text || '点击执行后，过程会显示在这里。每个 Workflow 只有一条 Run。'}</pre>;
+  return <pre
+    className="log-view"
+    ref={ref}
+    onScroll={() => {
+      const node = ref.current;
+      if (!node) return;
+      stickBottom.current = node.scrollHeight - node.scrollTop - node.clientHeight < 48;
+    }}
+  >{text || '点击执行后，过程会显示在这里。每个 Workflow 只有一条 Run。'}</pre>;
 });
 
 function ChatComposer({ placeholder, onSend, busy = false }: { placeholder: string; onSend: (text: string) => void | boolean | Promise<boolean>; busy?: boolean }) {
@@ -206,15 +219,19 @@ function ChatTurn({ message, fold }: { message: { id: number; role: string; cont
   </article>;
 }
 
+export type WorkflowVersionOption = { id: number; version: string; seq: number; name: string; publishedAt?: string };
+
 export function WorkflowBoard({
-  mode, name, version, nodes, edges, loops, capabilities, events, progress, checks, deliverables, directory, runStatus, runStatusCode,
-  onClose, onName, onVersion, onNodes, onEdges, onLoops, onPersist, onPublish, onExecute, onStop, onOpenDirectory, onOpenDeliverable, onLoadSummary, onReadFile, onListFiles, onUploadFile, onDeleteFile,
+  mode, name, version, versions, currentVersionId, nodes, edges, loops, capabilities, events, progress, checks, deliverables, directory, runStatus, runStatusCode,
+  onClose, onName, onSelectVersion, onNodes, onEdges, onLoops, onPersist, onPublish, onExecute, onStop, onOpenDirectory, onOpenDeliverable, onLoadSummary, onReadFile, onListFiles, onUploadFile, onDeleteFile,
   decisions, decisionNotes, onDecisionNote, onResolveDecision,
   chatNode, chatMessages, chatError, onOpenChat, onCloseChat, onSendChat,
 }: {
   mode: 'create' | 'view';
   name: string;
   version: string;
+  versions: WorkflowVersionOption[];
+  currentVersionId: number | null;
   nodes: BoardNode[];
   edges: BoardEdge[];
   loops: BoardLoop[];
@@ -228,7 +245,7 @@ export function WorkflowBoard({
   runStatusCode?: string;
   onClose: () => void;
   onName: (value: string) => void;
-  onVersion: (value: string) => void;
+  onSelectVersion: (versionId: number) => void;
   onNodes: (nodes: BoardNode[]) => void;
   onEdges: (edges: BoardEdge[]) => void;
   onLoops: (loops: BoardLoop[]) => void;
@@ -259,18 +276,31 @@ export function WorkflowBoard({
   const dragRef = useRef<{ key: string; dx: number; dy: number; x: number; y: number; moved: boolean } | null>(null);
   const sizeRef = useRef<{ key: string; x: number; y: number; w: number; h: number; moved: boolean } | null>(null);
   const chatRef = useRef<HTMLDivElement>(null);
+  const chatStickBottom = useRef(true);
   const [chatFold, setChatFold] = useState(0);
   function sendChat(text: string) {
-    if (text.trim()) setChatFold((value) => value + 1);
+    if (text.trim()) {
+      chatStickBottom.current = true;
+      setChatFold((value) => value + 1);
+    }
     return onSendChat(text);
+  }
+  function onChatLogScroll() {
+    const node = chatRef.current;
+    if (!node) return;
+    const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
+    chatStickBottom.current = distance < 48;
   }
   const linkRef = useRef<string | null>(null);
   const resizeRef = useRef<{ startY: number; startH: number } | null>(null);
   const paneRef = useRef<{ startX: number; startW: number } | null>(null);
   const nodesRef = useRef(nodes);
   const edgesRef = useRef(edges);
-  nodesRef.current = nodes;
-  edgesRef.current = edges;
+  // 拖动/缩放过程中不要用 props 覆盖本地尺寸，否则轮询重渲染会把放大结果冲掉
+  if (!dragRef.current && !sizeRef.current) {
+    nodesRef.current = nodes;
+    edgesRef.current = edges;
+  }
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
   const [selected, setSelected] = useState<string | null>(nodes[0]?.key ?? null);
   const [editor, setEditor] = useState<NodeEditor | null>(null);
@@ -283,7 +313,7 @@ export function WorkflowBoard({
   const [logHeight, setLogHeight] = useState(220);
   const [chatWidth, setChatWidth] = useState(340);
   const [banner, setBanner] = useState('');
-  const [acceptanceView, setAcceptanceView] = useState<NodeCheck | null>(null);
+  const [acceptanceView, setAcceptanceView] = useState<{ check: NodeCheck; nodeKey: string } | null>(null);
   const [decisionView, setDecisionView] = useState<number | null>(null);
   const seenDecisions = useRef<Set<number>>(new Set());
   const [nodeMenu, setNodeMenu] = useState<string | null>(null);
@@ -295,8 +325,18 @@ export function WorkflowBoard({
   const running = runStatusCode === 'running';
   const canEdit = !running;
 
-  useEffect(() => { if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight; }, [chatMessages, chatNode?.key]);
+  useEffect(() => {
+    chatStickBottom.current = true;
+  }, [chatNode?.key]);
+  useEffect(() => {
+    const node = chatRef.current;
+    if (!node || !chatStickBottom.current) return;
+    node.scrollTop = node.scrollHeight;
+  }, [chatMessages, chatNode?.key]);
   useEffect(() => { if (!running) setBanner(''); }, [running]);
+  useAutoDismiss(banner, setBanner);
+  useAutoDismiss(nodeError, setNodeError);
+  useAutoDismiss(summaryError, setSummaryError);
   const decisionsByNode = useMemo(() => {
     const map = new Map<string, BoardDecision>();
     for (const item of decisions ?? []) {
@@ -305,20 +345,42 @@ export function WorkflowBoard({
     }
     return map;
   }, [decisions]);
+  function openAcceptanceDetail(nodeKey: string, check?: NodeCheck | null, pending?: BoardDecision | null) {
+    const decision = pending ?? decisionsByNode.get(nodeKey) ?? null;
+    if (decision) setDecisionView(decision.id);
+    setAcceptanceView({
+      nodeKey,
+      check: check ?? checks[nodeKey] ?? {
+        verdict: 'unclear',
+        label: '待确认',
+        detail: decision?.question ?? '请确认后继续。',
+      },
+    });
+  }
   const activeDecision = decisions?.find((item) => item.id === decisionView) ?? null;
   useEffect(() => {
     const live = new Set((decisions ?? []).map((item) => item.id));
     for (const id of [...seenDecisions.current]) if (!live.has(id)) seenDecisions.current.delete(id);
-    if (decisionView != null && !live.has(decisionView)) setDecisionView(null);
+    if (decisionView != null && !live.has(decisionView)) {
+      setDecisionView(null);
+      setAcceptanceView(null);
+    }
     for (const item of decisions ?? []) {
       if (seenDecisions.current.has(item.id)) continue;
       seenDecisions.current.add(item.id);
       setDecisionView(item.id);
       const key = decisionNodeKey(item);
       if (key) setSelected(key);
+      // 校验待处理：直接打开详情面板，在面板里批准继续 / 再做一次
+      if (key && decisionKind(item) === 'acceptance') {
+        setAcceptanceView({
+          nodeKey: key,
+          check: checks[key] ?? { verdict: 'unclear', label: '待确认', detail: item.question },
+        });
+      }
       break;
     }
-  }, [decisions, decisionView]);
+  }, [decisions, decisionView, checks]);
   useEffect(() => {
     if (!nodeMenu) return;
     const close = (event: PointerEvent) => {
@@ -567,11 +629,30 @@ export function WorkflowBoard({
   return <div className="workflow-board" ref={boardRef} role="dialog" aria-label={editable ? '新建 Workflow' : name || 'Workflow'}>
     <header className="board-bar">
       <label>名称<input value={name} onChange={(event) => onName(event.target.value)} placeholder="例如实现功能" readOnly={!canEdit} /></label>
-      <label>版本<input value={version} onChange={(event) => onVersion(event.target.value)} placeholder="v1" readOnly={!canEdit} /></label>
+      <label>版本{versions.length ? (
+        <select
+          value={currentVersionId ?? ''}
+          onChange={(event) => {
+            const next = Number(event.target.value);
+            if (!Number.isInteger(next) || next < 1 || next === currentVersionId) return;
+            onSelectVersion(next);
+          }}
+          disabled={!versions.length}
+          title={version}
+        >
+          {!currentVersionId ? <option value="">未发布</option> : null}
+          {versions.map((item) => <option key={item.id} value={item.id}>{item.version}</option>)}
+        </select>
+      ) : (
+        <input value={version || '未发布'} readOnly />
+      )}</label>
       <label className="board-root">主目录<button type="button" title={directory || '打开主目录'} onClick={() => void onOpenDirectory()}>{directory || '打开主目录'}</button></label>
-      <div className="run-controls">
-        {editable ? <button type="button" onClick={onPublish}>发布 Workflow</button> : null}
-        <button type="button" onClick={onClose}>返回列表</button>
+      <div className="run-controls board-bar-actions">
+        <button type="button" onClick={() => { if (!guardEdit()) return; onPublish(); }} disabled={running}>{editable ? '发布 Workflow' : '发布'}</button>
+        <button type="button" onClick={() => void (async () => {
+          if (canEdit) await onPersist(nodesRef.current, edgesRef.current, true);
+          onClose();
+        })()}>返回列表</button>
       </div>
     </header>
     <div className={`board-body${chatNode ? ' with-chat' : ''}`} style={{ '--chat-width': `${chatWidth}px` } as CSSProperties}>
@@ -610,8 +691,13 @@ export function WorkflowBoard({
             const nodeStatus = progress[node.key];
             const statusLabel = nodeStatus ? NODE_STATUS[nodeStatus] ?? nodeStatus : '';
             const pending = decisionsByNode.get(node.key);
+            const check = checks[node.key];
+            // 有未处理决策就显示「待确认」；不要再卡进度状态，否则会只剩「不合格」却没有继续入口
+            const showDecision = Boolean(pending);
+            // unclear/待确认只走上面的决策按钮，确认后不再用校验标签显示「待确认」
+            const showCheck = Boolean(check) && !showDecision && (check.verdict === 'pass' || check.verdict === 'reject');
             const size = nodeBox(node);
-            return <article className={`board-node ${node.type} ${selected === node.key ? 'selected' : ''} ${nodeStatus ? `status-${nodeStatus}` : ''} ${pending ? 'needs-decision' : ''}`} key={node.key} style={{ left: node.x, top: node.y, width: size.w, height: size.h }} onPointerDown={(event) => startDrag(node, event)}>
+            return <article className={`board-node ${node.type} ${selected === node.key ? 'selected' : ''} ${nodeStatus ? `status-${nodeStatus}` : ''} ${showDecision ? 'needs-decision' : ''}`} key={node.key} style={{ left: node.x, top: node.y, width: size.w, height: size.h }} onPointerDown={(event) => startDrag(node, event)}>
             <button type="button" className="port in" data-port="in" data-node={node.key} aria-label="连入" />
             <div className="node-menu-wrap">
               <button type="button" className="node-more" data-action="menu" aria-label="更多" aria-expanded={nodeMenu === node.key} title="更多" onPointerDown={(event) => event.stopPropagation()} onClick={() => setNodeMenu((current) => current === node.key ? null : node.key)}>⋯</button>
@@ -621,9 +707,13 @@ export function WorkflowBoard({
                 {node.type === 'start' || node.type === 'end' ? null : <button type="button" role="menuitem" className="danger" data-action="menu" onPointerDown={(event) => event.stopPropagation()} onClick={() => { setNodeMenu(null); void removeNode(node.key); }}>删除</button>}
               </div> : null}
             </div>
-            {statusLabel ? <em className={`node-status ${nodeStatus}`}>{statusLabel}</em> : null}
-            {checks[node.key] ? <button type="button" className={`acceptance-mark ${checks[node.key].verdict}`} data-action="acceptance" title="查看判断依据" onClick={() => setAcceptanceView(checks[node.key])}>{checks[node.key].label}</button> : null}
-            {pending ? <button type="button" className="decision-mark" data-action="decision" title="在此节点确认" onPointerDown={(event) => event.stopPropagation()} onClick={() => setDecisionView(pending.id)}>待确认</button> : null}
+            {showDecision ? <button type="button" className="decision-mark" data-action="decision" title="在此节点确认" onPointerDown={(event) => event.stopPropagation()} onClick={() => {
+              if (decisionKind(pending!) === 'acceptance') openAcceptanceDetail(node.key, check, pending);
+              else setDecisionView(pending!.id);
+            }}>待确认</button> : <>
+              {statusLabel ? <em className={`node-status ${nodeStatus}`}>{statusLabel}</em> : null}
+              {showCheck ? <button type="button" className={`acceptance-mark ${check!.verdict}`} data-action="acceptance" title="查看判断依据" onClick={() => openAcceptanceDetail(node.key, check, pending)}>{check!.label}</button> : null}
+            </>}
             <strong>{node.name || (node.type === 'task' ? '未命名 Agent' : '未命名')}</strong>
             <small>{node.type === 'end' ? '点此查看流程进度和产物' : node.type === 'task' ? <em className="agent-mark">Agent 节点</em> : roleTitle(node.type)}{node.type === 'end' ? '' : loops.some((loop) => loop.nodeKeys.includes(node.key)) ? ' · 循环' : ''}{node.type === 'task' && node.acceptanceRule.trim() ? ' · 校验上游' : ''}{node.type !== 'end' && node.capabilities.length ? ` · ${capabilityText(node.capabilities)}` : ''}</small>
             <button type="button" className="port out" data-port="out" data-node={node.key} aria-label="连出" onPointerDown={(event) => startLink(node, event)} />
@@ -631,13 +721,12 @@ export function WorkflowBoard({
             <button type="button" className="node-add" data-action="add" aria-label="新建下一个 Agent 节点" onPointerDown={(event) => event.stopPropagation()} onClick={() => openCreate(node)} />
           </article>;
           })}
-          {activeDecision ? (() => {
+          {activeDecision && decisionKind(activeDecision) !== 'acceptance' ? (() => {
             const kind = decisionKind(activeDecision);
             const nodeKey = decisionNodeKey(activeDecision);
             const host = nodes.find((node) => node.key === nodeKey);
             if (!host) return null;
             const size = nodeBox(host);
-            const acceptance = kind === 'acceptance';
             const loop = kind === 'loop';
             return <div
               className="node-decision-pop"
@@ -650,14 +739,14 @@ export function WorkflowBoard({
                 <button type="button" onClick={() => setDecisionView(null)}>收起</button>
               </div>
               <p className="decision-question">{activeDecision.question}</p>
-              <textarea value={decisionNotes?.[activeDecision.id] ?? ''} onChange={(event) => onDecisionNote?.(activeDecision.id, event.target.value)} placeholder={acceptance ? '写下这次的说明，必填' : '写下这次复核的说明，必填'} />
+              <textarea value={decisionNotes?.[activeDecision.id] ?? ''} onChange={(event) => onDecisionNote?.(activeDecision.id, event.target.value)} placeholder="写下这次复核的说明，必填" />
               <div className="decision-actions">
-                <button type="button" className="decision-primary" onClick={() => onResolveDecision?.(activeDecision.id, 'approve')}>{acceptance ? '批准继续' : '批准'}</button>
-                {acceptance || loop ? <button type="button" onClick={() => onResolveDecision?.(activeDecision.id, 'repeat')}>再做一次</button> : null}
-                {acceptance ? null : <button type="button" onClick={() => onResolveDecision?.(activeDecision.id, 'request_changes')}>要求修改</button>}
-                {acceptance ? null : <button type="button" onClick={() => onResolveDecision?.(activeDecision.id, 'replan')}>重新规划</button>}
-                {acceptance ? null : <button type="button" className="danger" onClick={() => onResolveDecision?.(activeDecision.id, 'reject')}>拒绝</button>}
-                {acceptance ? null : <button type="button" onClick={() => onResolveDecision?.(activeDecision.id, 'override')}>Override</button>}
+                <button type="button" className="decision-primary" onClick={() => onResolveDecision?.(activeDecision.id, 'approve')}>批准</button>
+                {loop ? <button type="button" onClick={() => onResolveDecision?.(activeDecision.id, 'repeat')}>再做一次</button> : null}
+                <button type="button" onClick={() => onResolveDecision?.(activeDecision.id, 'request_changes')}>要求修改</button>
+                <button type="button" onClick={() => onResolveDecision?.(activeDecision.id, 'replan')}>重新规划</button>
+                <button type="button" className="danger" onClick={() => onResolveDecision?.(activeDecision.id, 'reject')}>拒绝</button>
+                <button type="button" onClick={() => onResolveDecision?.(activeDecision.id, 'override')}>Override</button>
               </div>
             </div>;
           })() : null}
@@ -669,7 +758,7 @@ export function WorkflowBoard({
         <div className="panel-head"><h3>{chatNode.name || (chatNode.type === 'task' ? '未命名 Agent' : '未命名')}</h3><button type="button" onClick={onCloseChat}>关闭</button></div>
         <p className="muted">{chatNode.type === 'checkpoint' ? '给这次人工复核补充指导。这些话会留在复核说明里。' : running ? '执行还在进行，也可以直接对话。这次执行不会中途改口，新的指导留给它之后的执行。' : '和这个 Agent 沟通。指导会留下来，它之后和下游 Agent 协作时也会带上。'}</p>
         {chatError ? <p className="alert">{chatError}</p> : null}
-        <div className="node-chat-log" ref={chatRef}>
+        <div className="node-chat-log" ref={chatRef} onScroll={onChatLogScroll}>
           {chatMessages.length ? chatMessages.map((message) => <ChatTurn message={message} fold={chatFold} key={message.id} />) : <p className="muted">{chatNode.type === 'checkpoint' ? '还没有指导。写下这次复核要特别看什么。' : '还没有对话。写下你希望这个 Agent 怎么做。'}</p>}
         </div>
         <ChatComposer key={chatNode.key} busy={chatMessages.some((item) => item.status === 'streaming' || item.status === 'pending')} placeholder={chatNode.type === 'checkpoint' ? '告诉这次复核要看什么，回车发送' : '指导这个 Agent，回车发送'} onSend={sendChat} />
@@ -688,8 +777,8 @@ export function WorkflowBoard({
         {editor.type === 'task' || editor.type === 'checkpoint' ? <CapabilityPicker label="能力" hint={editor.type === 'checkpoint' ? '从下拉里选择，至少一项。复核时按这些能力看上游 Agent 的产出。' : '从下拉里选择，至少一项。协作时按这些能力理解这个 Agent。'} options={capabilities} selected={editor.capabilities} onChange={(next) => setEditor({ ...editor, capabilities: next })} /> : null}
         {editor.type === 'task' || editor.type === 'checkpoint' ? <label>任务说明<textarea value={editor.instruction} onChange={(event) => setEditor({ ...editor, instruction: event.target.value })} placeholder={editor.type === 'checkpoint' ? '这次复核要确认的事' : '这个 Agent 每次要做的事，例如根据上游 Agent 的产出整理范围'} /></label> : null}
         {editor.type === 'task' || editor.type === 'checkpoint' ? <label>产出要求<textarea value={editor.outputRequirement} onChange={(event) => setEditor({ ...editor, outputRequirement: event.target.value })} placeholder={editor.type === 'checkpoint' ? '通过前要看到的产出，例如需求分析文档已包含验收标准' : '必须交出来的文件和结构，例如写成《需求分析文档》，包含背景、用户、功能范围、不做的事、验收标准'} /></label> : null}
-        {editor.type === 'task' ? <div className="rule-list"><span>上游产物校验规则</span><small className="field-hint">点加号添加一条。每一条都是不合格条件，满足任意一条就不合格。一条都不加则视为合格。不合格会退回给出这份内容的节点，不用另配循环。</small>{editor.acceptanceRules.map((rule) => <div className="rule-row" key={rule.id}><input value={rule.text} onChange={(event) => setEditor({ ...editor, acceptanceRules: editor.acceptanceRules.map((item) => item.id === rule.id ? { ...item, text: event.target.value } : item) })} placeholder="例如缺少需求背景说明" /><button type="button" onClick={() => setEditor({ ...editor, acceptanceRules: editor.acceptanceRules.filter((item) => item.id !== rule.id) })}>移除</button></div>)}<button type="button" className="rule-add" onClick={() => setEditor({ ...editor, acceptanceRules: [...editor.acceptanceRules, { id: `new-${Date.now()}`, text: '' }] })}>+</button></div> : null}
-        {editor.type === 'task' ? <label>最多退回次数<input type="number" min={1} value={editor.maxRedos} onChange={(event) => setEditor({ ...editor, maxRedos: event.target.value })} /><small className="field-hint">只有填写了上游产物校验规则才会计数，默认 3 次。</small></label> : null}
+        {editor.type === 'task' ? <div className="rule-list"><span>上游产物校验规则</span><small className="field-hint">点加号添加一条。每一条都是不合格条件，满足任意一条就不合格。一条都不加则视为合格。不合格会退回给出这份内容的节点。</small>{editor.acceptanceRules.map((rule) => <div className="rule-row" key={rule.id}><input value={rule.text} onChange={(event) => setEditor({ ...editor, acceptanceRules: editor.acceptanceRules.map((item) => item.id === rule.id ? { ...item, text: event.target.value } : item) })} placeholder="例如缺少需求背景说明" /><button type="button" onClick={() => setEditor({ ...editor, acceptanceRules: editor.acceptanceRules.filter((item) => item.id !== rule.id) })}>移除</button></div>)}<button type="button" className="rule-add" onClick={() => setEditor({ ...editor, acceptanceRules: [...editor.acceptanceRules, { id: `new-${Date.now()}`, text: '' }] })}>+</button></div> : null}
+        {editor.type === 'task' ? <label>最多退回次数<input type="number" min={1} value={editor.maxRedos} onChange={(event) => setEditor({ ...editor, maxRedos: event.target.value })} /><small className="field-hint">不合格时最多自动退回这么多次；达到后会停下来让你确认。填 1 表示只自动退回 1 次。默认 3。改完后请保存节点再执行。</small></label> : null}
         {editor.type === 'checkpoint' ? <label>询问<input value={editor.question} onChange={(event) => setEditor({ ...editor, question: event.target.value })} placeholder="例如是否批准这次改动？" /></label> : null}
         <div className="run-controls"><button type="submit">保存</button><button type="button" onClick={() => setEditor(null)}>取消</button></div>
       </form>
@@ -721,12 +810,36 @@ export function WorkflowBoard({
         <pre className="prose">{fileView.text}</pre>
       </div>
     </div> : null}
-    {acceptanceView ? <div className="node-dialog-backdrop" onMouseDown={() => setAcceptanceView(null)}>
-      <div className="node-dialog panel" role="dialog" aria-modal="true" aria-label="校验结果" onMouseDown={(event) => event.stopPropagation()}>
-        <div className="panel-head"><h3>校验结果 · {acceptanceView.label}</h3><button type="button" onClick={() => setAcceptanceView(null)}>关闭</button></div>
-        <p className="prose">{acceptanceView.detail}</p>
-      </div>
-    </div> : null}
+    {acceptanceView ? (() => {
+      const pending = decisionsByNode.get(acceptanceView.nodeKey) ?? null;
+      const acceptanceDecision = pending && decisionKind(pending) === 'acceptance' ? pending : null;
+      const returns = (acceptanceView.check.history ?? []).filter((item) => item.verdict === 'reject');
+      return <div className="node-dialog-backdrop" onMouseDown={() => setAcceptanceView(null)}>
+        <div className="node-dialog panel" role="dialog" aria-modal="true" aria-label="校验结果" onMouseDown={(event) => event.stopPropagation()}>
+          <div className="panel-head"><h3>校验结果 · {acceptanceView.check.label}</h3><button type="button" onClick={() => setAcceptanceView(null)}>关闭</button></div>
+          {returns.length ? <div className="acceptance-history">
+            <h4>退回记录 · {returns.length} 次</h4>
+            {returns.map((item, index) => <article className="acceptance-history-item" key={`${item.at ?? index}-${index}`}>
+              <header><span>第 {index + 1} 次退回</span>{item.at ? <time>{beijingClock(item.at)}</time> : null}</header>
+              <p className="prose">{item.detail}</p>
+            </article>)}
+          </div> : null}
+          <div className="acceptance-current">
+            <h4>{acceptanceDecision ? '本次判断' : returns.length ? '最终结果' : '判断依据'}</h4>
+            <p className="prose">{acceptanceView.check.detail || acceptanceDecision?.question || '（没有写出具体原因）'}</p>
+          </div>
+          {acceptanceDecision ? <div className="decision-detail">
+            <h4>待处理 · 确认后继续</h4>
+            <p className="decision-question">{acceptanceDecision.question}</p>
+            <textarea value={decisionNotes?.[acceptanceDecision.id] ?? ''} onChange={(event) => onDecisionNote?.(acceptanceDecision.id, event.target.value)} placeholder="写下这次的说明，必填" />
+            <div className="decision-actions">
+              <button type="button" className="decision-primary" onClick={() => { onResolveDecision?.(acceptanceDecision.id, 'approve'); setAcceptanceView(null); setDecisionView(null); }}>批准继续</button>
+              <button type="button" onClick={() => { onResolveDecision?.(acceptanceDecision.id, 'repeat'); setAcceptanceView(null); setDecisionView(null); }}>再做一次</button>
+            </div>
+          </div> : null}
+        </div>
+      </div>;
+    })() : null}
     {loopOpen ? <div className="node-dialog-backdrop" onMouseDown={() => setLoopOpen(false)}>
       <form className="node-dialog panel form" role="dialog" aria-modal="true" aria-label="设置循环" onMouseDown={(event) => event.stopPropagation()} onSubmit={(event) => {
         event.preventDefault();

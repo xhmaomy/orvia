@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Duplex } from 'node:stream';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { and, asc, count, desc, eq, inArray, or, type SQL } from 'drizzle-orm';
+import { and, asc, count, desc, eq, inArray, notInArray, or, sql, type SQL } from 'drizzle-orm';
 import { config } from '../config.js';
 import { acceptWebSocket, sendWebSocketText } from './websocket.js';
 import { db, pool } from '../db/client.js';
@@ -26,6 +26,7 @@ import {
   workflowEdges,
   workflowNodes,
   workflowRuns,
+  workflowVersions,
   workflows,
 } from '../db/schema.js';
 import { OrviaError } from '../domain/errors.js';
@@ -39,11 +40,24 @@ import {
   registerUser,
 } from '../application/tenancy.js';
 import { resolveAgentModel, resolveWorkflowNode } from '../application/model-resolver.js';
-import { assertCatalogKeys, collectCapabilityKeys, ensureProjectCapabilities, normalizeCapabilityKey, storedNodeCapabilityKeys, workflowNodeCapabilityKeys } from '../application/capabilities.js';
+import { assertProjectCatalogKeys, collectCapabilityKeys, ensureTenantCapabilities, normalizeCapabilityKey, storedNodeCapabilityKeys, workflowNodeCapabilityKeys } from '../application/capabilities.js';
 import { deleteAgentsByIds } from '../application/delete-agents.js';
 import { assertWorkingDirectoryAllowed } from '../application/runtime-policy.js';
 import { acceptanceLimit, acceptanceRuleLines, parseAcceptanceVerdict, type AcceptanceParty } from '../application/acceptance.js';
 import { assertAcyclicGraph, graphIsComplete, selectRunnableTasks } from '../application/task-graph.js';
+import { pickLatestTasksByKey, resumeFrontier } from '../application/resume-graph.js';
+import {
+  buildMysqlUrl,
+  buildRedisUrl,
+  maskSecret,
+  parseMysqlUrl,
+  parseRedisUrl,
+  probeMysql,
+  probePi,
+  probeRedis,
+  readLocalEnv,
+  writeLocalEnv,
+} from '../application/local-env.js';
 import {
   allocateSequenceFolder,
   deleteInputFile,
@@ -70,7 +84,13 @@ import {
   writeStartInput,
   writeTaskBrief,
 } from '../application/workflow-workspace.js';
-import { ensureTables, repairEnums, repairSchema, schemaIntegrityIssues } from '../db/ensure-schema.js';
+import {
+  formatWorkflowVersionLabel,
+  MAX_WORKFLOW_VERSIONS,
+  nextWorkflowVersionSeq,
+  versionsToPrune,
+} from '../application/workflow-versions.js';
+import { ensureTables, migrateCapabilitiesToTenant, repairEnums, repairSchema, schemaIntegrityIssues } from '../db/ensure-schema.js';
 import { connectRedis, redisDisplayUrl, redisRuntime } from '../infrastructure/redis.js';
 import { piRuntime } from '../runtime/pi-adapter.js';
 
@@ -79,7 +99,7 @@ function sendJson(response: ServerResponse, status: number, payload: unknown) {
     'content-type': 'application/json; charset=utf-8',
     'access-control-allow-origin': config.webOrigin,
     'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
-    'access-control-allow-headers': 'content-type, authorization, x-orvia-tenant-id',
+    'access-control-allow-headers': 'content-type, authorization, x-orvia-tenant-id, x-orvia-filename',
   });
   response.end(JSON.stringify(payload));
 }
@@ -238,6 +258,7 @@ async function deleteWorkflowCascade(workflowId: number): Promise<void> {
     await tx.delete(workflowEdges).where(eq(workflowEdges.workflowId, workflowId));
     await tx.delete(workflowNodes).where(eq(workflowNodes.workflowId, workflowId));
     await tx.delete(workflowRuns).where(eq(workflowRuns.workflowId, workflowId));
+    await tx.delete(workflowVersions).where(eq(workflowVersions.workflowId, workflowId));
     await tx.delete(workflows).where(eq(workflows.id, workflowId));
   });
 }
@@ -276,12 +297,32 @@ function broadcastEvent(event: unknown, projectId: number) {
 
 type NewEvent = typeof events.$inferInsert;
 
-async function persistAndBroadcastEvent(event: NewEvent) {
-  const result = await db.insert(events).values(event);
+/** 流式执行碎片只给前端实时看，不落库，避免 ov_events 被刷爆 */
+const EPHEMERAL_RUNTIME_TYPES = new Set(['stdout', 'stderr', 'thinking', 'activity']);
+const EPHEMERAL_EVENT_TYPES = [...EPHEMERAL_RUNTIME_TYPES].map((type) => `runtime.pi.${type}`);
+let ephemeralEventSeq = 0;
+
+async function resolveEventVersionId(event: Pick<NewEvent, 'workflowVersionId' | 'workflowRunId'>): Promise<number | undefined> {
+  if (event.workflowVersionId != null) return event.workflowVersionId;
+  if (!event.workflowRunId) return undefined;
+  const run = (await db.select({
+    workflowVersionId: workflowRuns.workflowVersionId,
+    workflowId: workflowRuns.workflowId,
+  }).from(workflowRuns).where(eq(workflowRuns.id, event.workflowRunId)).limit(1))[0];
+  if (run?.workflowVersionId != null) return run.workflowVersionId;
+  if (!run?.workflowId) return undefined;
+  const workflow = (await db.select({ currentVersionId: workflows.currentVersionId }).from(workflows).where(eq(workflows.id, run.workflowId)).limit(1))[0];
+  return workflow?.currentVersionId ?? undefined;
+}
+
+async function broadcastEphemeralEvent(event: NewEvent) {
+  // 不查库、不落库；只经 Redis 推给面板。id 用大基数递增，避免和库内自增 id 冲突
+  ephemeralEventSeq += 1;
   const envelope = {
-    id: result[0].insertId,
+    id: 1_000_000_000 + ephemeralEventSeq,
     projectId: event.projectId,
     workflowRunId: event.workflowRunId ?? null,
+    workflowVersionId: event.workflowVersionId ?? null,
     taskId: event.taskId ?? null,
     sessionId: event.sessionId ?? null,
     agentId: event.agentId ?? null,
@@ -291,6 +332,179 @@ async function persistAndBroadcastEvent(event: NewEvent) {
   };
   await redisRuntime().publish('orvia:events', JSON.stringify(envelope));
   return envelope;
+}
+
+async function persistAndBroadcastEvent(event: NewEvent) {
+  const workflowVersionId = await resolveEventVersionId(event);
+  const row = { ...event, workflowVersionId };
+  const result = await db.insert(events).values(row);
+  const envelope = {
+    id: result[0].insertId,
+    projectId: row.projectId,
+    workflowRunId: row.workflowRunId ?? null,
+    workflowVersionId: row.workflowVersionId ?? null,
+    taskId: row.taskId ?? null,
+    sessionId: row.sessionId ?? null,
+    agentId: row.agentId ?? null,
+    type: row.type,
+    payload: row.payloadJson ?? null,
+    occurredAt: new Date().toISOString(),
+  };
+  await redisRuntime().publish('orvia:events', JSON.stringify(envelope));
+  return envelope;
+}
+
+async function emitRuntimeEvent(
+  base: Omit<NewEvent, 'type' | 'payloadJson'>,
+  runtimeType: string,
+  payload: unknown,
+) {
+  const event = { ...base, type: `runtime.pi.${runtimeType}`, payloadJson: payload };
+  try {
+    if (EPHEMERAL_RUNTIME_TYPES.has(runtimeType)) {
+      await broadcastEphemeralEvent(event);
+      return;
+    }
+    await persistAndBroadcastEvent(event);
+  } catch (error) {
+    console.error(JSON.stringify({
+      level: 'error',
+      type: 'runtime.event.emit_failed',
+      runtimeType,
+      message: error instanceof Error ? error.message : String(error),
+    }));
+  }
+}
+
+const ACTIVE_RUN_STATUSES = ['running', 'paused', 'awaiting_decision'] as const;
+
+function isActiveRunStatus(status: string | null | undefined): boolean {
+  return typeof status === 'string' && (ACTIVE_RUN_STATUSES as readonly string[]).includes(status);
+}
+
+async function deleteWorkflowVersionLogs(versionIds: number[]): Promise<void> {
+  if (versionIds.length === 0) return;
+  await db.delete(events).where(inArray(events.workflowVersionId, versionIds));
+  await db.delete(nodeMessages).where(inArray(nodeMessages.workflowVersionId, versionIds));
+}
+
+async function pruneWorkflowVersions(workflowId: number): Promise<number[]> {
+  const rows = await db.select({
+    id: workflowVersions.id,
+    seq: workflowVersions.seq,
+  }).from(workflowVersions).where(eq(workflowVersions.workflowId, workflowId));
+  const doomed = versionsToPrune(rows, MAX_WORKFLOW_VERSIONS);
+  const ids = doomed.map((row) => row.id);
+  if (ids.length === 0) return [];
+  await deleteWorkflowVersionLogs(ids);
+  await db.update(workflowRuns).set({ workflowVersionId: null }).where(inArray(workflowRuns.workflowVersionId, ids));
+  await db.delete(workflowVersions).where(inArray(workflowVersions.id, ids));
+  return ids;
+}
+
+async function ensureLegacyWorkflowVersion(workflowId: number): Promise<typeof workflowVersions.$inferSelect | null> {
+  const workflow = (await db.select().from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
+  if (!workflow || workflow.status !== 'published') return null;
+  const existing = await db.select().from(workflowVersions)
+    .where(eq(workflowVersions.workflowId, workflowId))
+    .orderBy(desc(workflowVersions.seq));
+  if (existing[0]) {
+    if (!workflow.currentVersionId) {
+      await db.update(workflows).set({ currentVersionId: existing[0].id, version: existing[0].version }).where(eq(workflows.id, workflowId));
+    }
+    return existing[0];
+  }
+  const definitionJson = workflow.definitionJson ?? { nodes: [], edges: [] };
+  const prepared = prepareWorkflowDefinition(definitionJson, false);
+  if (prepared.definitionNodes.length === 0) return null;
+  const seq = 1;
+  const version = formatWorkflowVersionLabel(seq);
+  const inserted = await db.insert(workflowVersions).values({
+    workflowId,
+    version,
+    seq,
+    name: workflow.name,
+    definitionJson,
+  });
+  const versionId = inserted[0].insertId;
+  await db.update(workflows).set({ version, currentVersionId: versionId }).where(eq(workflows.id, workflowId));
+  const row = (await db.select().from(workflowVersions).where(eq(workflowVersions.id, versionId)).limit(1))[0];
+  return row ?? null;
+}
+
+async function publishWorkflowVersion(workflowId: number, input: {
+  name: string;
+  definitionJson: unknown;
+}): Promise<{ versionId: number; version: string; seq: number; pruned: number[] }> {
+  const workflow = (await db.select().from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
+  if (!workflow) throw new OrviaError('Workflow not found', 'not_found', 404);
+  const active = (await db.select({ id: workflowRuns.id, status: workflowRuns.status }).from(workflowRuns)
+    .where(eq(workflowRuns.workflowId, workflowId)).limit(1))[0];
+  if (active && isActiveRunStatus(active.status)) {
+    throw new OrviaError('请先停止正在运行的 Run，再发布新版本', 'conflict', 409);
+  }
+  const prepared = prepareWorkflowDefinition(input.definitionJson, true);
+  if (prepared.definitionNodes.length === 0) throw new OrviaError('请至少添加一个节点', 'validation', 400);
+  await assertProjectCatalogKeys(workflow.projectId, prepared.nodeCapabilityLists.flat());
+  const maxSeqRow = (await db.select({ seq: workflowVersions.seq }).from(workflowVersions)
+    .where(eq(workflowVersions.workflowId, workflowId))
+    .orderBy(desc(workflowVersions.seq))
+    .limit(1))[0];
+  const seq = nextWorkflowVersionSeq(maxSeqRow?.seq);
+  const version = formatWorkflowVersionLabel(seq);
+  const definitionJson = input.definitionJson ?? { nodes: [], edges: [] };
+  const created = await db.transaction(async (tx) => {
+    const inserted = await tx.insert(workflowVersions).values({
+      workflowId,
+      version,
+      seq,
+      name: input.name,
+      definitionJson,
+    });
+    const versionId = inserted[0].insertId;
+    await tx.update(workflows).set({
+      name: input.name,
+      version,
+      currentVersionId: versionId,
+      definitionJson,
+      status: 'published',
+    }).where(eq(workflows.id, workflowId));
+    await insertWorkflowGraph(tx, workflowId, prepared, true, true);
+    await tx.update(workflowRuns).set({ workflowVersionId: versionId }).where(eq(workflowRuns.workflowId, workflowId));
+    return versionId;
+  });
+  await managedWorkflowRoot(workflowId);
+  const pruned = await pruneWorkflowVersions(workflowId);
+  return { versionId: created, version, seq, pruned };
+}
+
+async function activateWorkflowVersion(workflowId: number, versionId: number): Promise<{ version: string }> {
+  const workflow = (await db.select().from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
+  if (!workflow) throw new OrviaError('Workflow not found', 'not_found', 404);
+  const active = (await db.select({ id: workflowRuns.id, status: workflowRuns.status }).from(workflowRuns)
+    .where(eq(workflowRuns.workflowId, workflowId)).limit(1))[0];
+  if (active && isActiveRunStatus(active.status)) {
+    throw new OrviaError('请先停止 Run，才能切换历史版本', 'conflict', 409);
+  }
+  const snapshot = (await db.select().from(workflowVersions)
+    .where(and(eq(workflowVersions.id, versionId), eq(workflowVersions.workflowId, workflowId)))
+    .limit(1))[0];
+  if (!snapshot) throw new OrviaError('版本不存在', 'not_found', 404);
+  const prepared = prepareWorkflowDefinition(snapshot.definitionJson, true);
+  await assertProjectCatalogKeys(workflow.projectId, prepared.nodeCapabilityLists.flat());
+  await db.transaction(async (tx) => {
+    await tx.update(workflows).set({
+      name: snapshot.name,
+      version: snapshot.version,
+      currentVersionId: snapshot.id,
+      definitionJson: snapshot.definitionJson,
+      status: 'published',
+    }).where(eq(workflows.id, workflowId));
+    await insertWorkflowGraph(tx, workflowId, prepared, true, true);
+    await tx.update(workflowRuns).set({ workflowVersionId: snapshot.id }).where(eq(workflowRuns.workflowId, workflowId));
+  });
+  await managedWorkflowRoot(workflowId);
+  return { version: snapshot.version };
 }
 
 async function rememberRunStatus(workflowRunId: number, status: RunStatus, workflowId?: number) {
@@ -340,13 +554,26 @@ async function rebuildWorkflowRunGraph(workflowRunId: number, workflowId: number
   if (nodes.length === 0) throw new OrviaError('这个 Workflow 还没有节点', 'validation', 400);
   const edges = await db.select().from(workflowEdges).where(eq(workflowEdges.workflowId, workflowId)).orderBy(asc(workflowEdges.id));
   const projectId = await runProjectId(workflowRunId);
+  const previousTaskIds = (await db.select({ id: tasks.id }).from(tasks).where(eq(tasks.workflowRunId, workflowRunId))).map((task) => task.id);
   const rebuilt = await db.transaction(async (tx) => {
     const oldPlans = await tx.select().from(plans).where(eq(plans.workflowRunId, workflowRunId)).orderBy(desc(plans.version));
     const version = (oldPlans[0]?.version ?? 0) + 1;
     await tx.update(plans).set({ status: 'superseded' }).where(and(eq(plans.workflowRunId, workflowRunId), eq(plans.status, 'active')));
     await tx.update(tasks).set({ status: 'cancelled' }).where(eq(tasks.workflowRunId, workflowRunId));
-    await tx.update(checkpoints).set({ status: 'superseded' }).where(and(eq(checkpoints.workflowRunId, workflowRunId), eq(checkpoints.status, 'pending')));
+    if (previousTaskIds.length > 0) {
+      await tx.update(sessions).set({
+        status: 'failed',
+        completedAt: new Date(),
+        outputJson: { error: 'Run restarted from the beginning' },
+      }).where(and(inArray(sessions.taskId, previousTaskIds), inArray(sessions.status, ['pending', 'running', 'paused'])));
+    }
+    await tx.update(checkpoints).set({ status: 'superseded', resolvedAt: new Date() }).where(and(eq(checkpoints.workflowRunId, workflowRunId), eq(checkpoints.status, 'pending')));
     await tx.update(decisions).set({ status: 'superseded', resolvedAt: new Date() }).where(and(eq(decisions.workflowRunId, workflowRunId), eq(decisions.status, 'pending')));
+    const currentInput = jsonObject((await tx.select({ inputJson: workflowRuns.inputJson }).from(workflowRuns).where(eq(workflowRuns.id, workflowRunId)))[0]?.inputJson);
+    const keptInput = { ...currentInput };
+    delete keptInput.executionId;
+    delete keptInput.acceptanceRedos;
+    delete keptInput.loopIterations;
     const planResult = await tx.insert(plans).values({
       workflowRunId,
       version,
@@ -368,6 +595,13 @@ async function rebuildWorkflowRunGraph(workflowRunId: number, workflowId: number
         dependsOnNodeIds: depends,
       };
       delete inputJson.skill;
+      delete inputJson.acceptanceResult;
+      delete inputJson.acceptanceHistory;
+      delete inputJson.acceptanceWaived;
+      delete inputJson.redoReason;
+      delete inputJson.redoRound;
+      delete inputJson.workspacePath;
+      delete inputJson.prompt;
       const taskResult = await tx.insert(tasks).values({
         workflowRunId,
         planId,
@@ -381,7 +615,12 @@ async function rebuildWorkflowRunGraph(workflowRunId: number, workflowId: number
       const sessionResult = await tx.insert(sessions).values({ taskId, runtime: 'pi', status: 'pending', inputJson });
       planned.push({ nodeId: node.id, taskId, sessionId: sessionResult[0].insertId, capabilities, nodeType: node.nodeType, dependsOnNodeIds: depends });
     }
-    await tx.update(workflowRuns).set({ currentPlanVersion: version, errorJson: null, completedAt: null }).where(eq(workflowRuns.id, workflowRunId));
+    await tx.update(workflowRuns).set({
+      currentPlanVersion: version,
+      errorJson: null,
+      completedAt: null,
+      inputJson: { ...keptInput, acceptanceRedos: {}, loopIterations: {} },
+    }).where(eq(workflowRuns.id, workflowRunId));
     return { planId, version, planned };
   });
   await persistAndBroadcastEvent({
@@ -401,14 +640,17 @@ async function resumeMatches(workflowRunId: number, workflowId: number) {
   const nodes = await db.select().from(workflowNodes).where(eq(workflowNodes.workflowId, workflowId)).orderBy(asc(workflowNodes.id));
   const edges = await db.select().from(workflowEdges).where(eq(workflowEdges.workflowId, workflowId));
   const taskRows = await db.select().from(tasks).where(eq(tasks.workflowRunId, workflowRunId)).orderBy(asc(tasks.id));
-  const latestByKey = new Map<string, typeof tasks.$inferSelect>();
-  for (const task of taskRows) {
-    const key = recordKey(task.inputJson);
-    if (key) latestByKey.set(key, task);
-  }
+  const latestByKey = pickLatestTasksByKey(taskRows.map((task) => ({
+    id: task.id,
+    key: recordKey(task.inputJson),
+    name: task.name,
+    status: task.status,
+    task,
+  })));
   const seen = new Set<number>();
   const matches = nodes.map((node) => {
-    const task = latestByKey.get(recordKey(node.configJson));
+    const picked = latestByKey.get(recordKey(node.configJson));
+    const task = picked?.task;
     if (!task || seen.has(task.id)) throw new OrviaError('Agent 已经改过，不能从暂停处继续。请选择从头开始。', 'validation', 409);
     seen.add(task.id);
     const depends = edges.filter((edge) => edge.targetNodeId === node.id).map((edge) => edge.sourceNodeId);
@@ -419,16 +661,41 @@ async function resumeMatches(workflowRunId: number, workflowId: number) {
 }
 
 async function assertResumePossible(workflowRunId: number, workflowId: number): Promise<string[]> {
+  const pendingDecision = (await db.select({ id: decisions.id }).from(decisions)
+    .where(and(eq(decisions.workflowRunId, workflowRunId), eq(decisions.status, 'pending')))
+    .limit(1))[0];
+  if (pendingDecision) {
+    throw new OrviaError('当前在等待确认。请先在面板上处理待确认，或选择从头开始。', 'validation', 409);
+  }
   const matches = await resumeMatches(workflowRunId, workflowId);
-  const byNode = new Map(matches.map((item) => [item.node.id, item]));
-  const frontier = matches.filter((item) => {
-    if (item.task.status === 'completed') return false;
-    return item.depends.every((nodeId) => byNode.get(nodeId)?.task.status === 'completed');
+  const nodeInfos = matches.map((item) => ({
+    key: recordKey(item.node.configJson) || `node-${item.node.id}`,
+    name: item.node.name,
+  }));
+  const edgeInfos = (await db.select().from(workflowEdges).where(eq(workflowEdges.workflowId, workflowId))).flatMap((edge) => {
+    const source = matches.find((item) => item.node.id === edge.sourceNodeId);
+    const target = matches.find((item) => item.node.id === edge.targetNodeId);
+    if (!source || !target) return [];
+    return [{
+      source: recordKey(source.node.configJson) || `node-${source.node.id}`,
+      target: recordKey(target.node.configJson) || `node-${target.node.id}`,
+    }];
   });
-  if (frontier.length === 0) {
+  const tasksByKey = new Map(matches.map((item) => {
+    const key = recordKey(item.node.configJson) || `node-${item.node.id}`;
+    return [key, { id: item.task.id, key, name: item.task.name, status: item.task.status }] as const;
+  }));
+  const frontier = resumeFrontier(nodeInfos, edgeInfos, tasksByKey);
+  if (!frontier.ok) {
+    if (frontier.reason === 'awaiting') {
+      throw new OrviaError('当前在等待确认。请先在面板上处理待确认，或选择从头开始。', 'validation', 409);
+    }
+    if (frontier.reason === 'changed') {
+      throw new OrviaError('Agent 已经改过，不能从暂停处继续。请选择从头开始。', 'validation', 409);
+    }
     throw new OrviaError('当前没有暂停的 Agent，这次已经全部完成。请选择从头开始。', 'validation', 409);
   }
-  return frontier.map((item) => item.node.name);
+  return frontier.names;
 }
 
 async function resumeInterruptedTasks(workflowRunId: number, workflowId: number): Promise<void> {
@@ -436,14 +703,16 @@ async function resumeInterruptedTasks(workflowRunId: number, workflowId: number)
   const matches = await resumeMatches(workflowRunId, workflowId);
   const byNode = new Map(matches.map((item) => [item.node.id, item]));
   for (const item of matches) {
+    // Keep finished nodes as-is so「从当前节点继续」不会丢掉已完成产物
     if (item.task.status === 'completed') {
       await db.update(tasks).set({ workflowNodeId: item.node.id }).where(eq(tasks.id, item.task.id));
       continue;
     }
     const ready = item.depends.every((nodeId) => byNode.get(nodeId)?.task.status === 'completed');
     const capabilities = storedNodeCapabilityKeys(item.node);
+    const previous = jsonObject(item.task.inputJson);
     const inputJson: Record<string, unknown> = {
-      ...jsonObject(item.task.inputJson),
+      ...previous,
       ...withoutLegacySkill(jsonObject(item.node.configJson)),
       capabilities,
       capability: capabilities[0],
@@ -452,6 +721,11 @@ async function resumeInterruptedTasks(workflowRunId: number, workflowId: number)
       dependsOnNodeIds: item.depends,
     };
     delete inputJson.skill;
+    // Resume re-runs incomplete nodes; drop stale wait markers but keep redo context if any
+    delete inputJson.acceptanceWaived;
+    if (item.task.status === 'awaiting_decision' || item.task.status === 'cancelled' || item.task.status === 'failed') {
+      delete inputJson.acceptanceResult;
+    }
     await db.update(tasks).set({
       workflowNodeId: item.node.id,
       name: item.node.name,
@@ -469,6 +743,8 @@ async function resumeInterruptedTasks(workflowRunId: number, workflowId: number)
         startedAt: null,
         inputJson,
       }).where(eq(sessions.id, session.id));
+    } else {
+      await db.insert(sessions).values({ taskId: item.task.id, runtime: 'pi', status: 'pending', inputJson });
     }
   }
   await persistAndBroadcastEvent({
@@ -477,6 +753,35 @@ async function resumeInterruptedTasks(workflowRunId: number, workflowId: number)
     type: 'workflow.resumed',
     payloadJson: { message: `从${names.join('、')}继续`, nodes: names },
   });
+}
+
+/** 图结构未变时也会复用旧 task；把节点上最新的校验配置同步进去，避免 maxRedos 仍停留在默认 3 */
+async function syncTaskConfigsFromNodes(workflowRunId: number, workflowId: number): Promise<void> {
+  const nodes = await db.select().from(workflowNodes).where(eq(workflowNodes.workflowId, workflowId));
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const taskRows = await db.select().from(tasks).where(eq(tasks.workflowRunId, workflowRunId));
+  for (const task of taskRows) {
+    if (!task.workflowNodeId || task.status === 'cancelled' || task.status === 'completed' || task.status === 'running') continue;
+    const node = byId.get(task.workflowNodeId);
+    if (!node) continue;
+    const previous = jsonObject(task.inputJson);
+    const config = withoutLegacySkill(jsonObject(node.configJson));
+    const capabilities = storedNodeCapabilityKeys(node);
+    const inputJson: Record<string, unknown> = {
+      ...previous,
+      ...config,
+      capabilities,
+      capability: capabilities[0],
+      workflowNodeId: node.id,
+      nodeType: node.nodeType,
+      dependsOnNodeIds: previous.dependsOnNodeIds,
+    };
+    delete inputJson.skill;
+    if (JSON.stringify(inputJson) === JSON.stringify(previous)) continue;
+    await db.update(tasks).set({ name: node.name, inputJson }).where(eq(tasks.id, task.id));
+    const session = (await db.select({ id: sessions.id }).from(sessions).where(eq(sessions.taskId, task.id)).orderBy(desc(sessions.id)).limit(1))[0];
+    if (session) await db.update(sessions).set({ inputJson }).where(eq(sessions.id, session.id));
+  }
 }
 
 async function prepareWorkflowRunForExecution(workflowRunId: number, workflowId: number, status: string, mode?: 'restart' | 'resume') {
@@ -490,14 +795,19 @@ async function prepareWorkflowRunForExecution(workflowRunId: number, workflowId:
   }
   const matches = await workflowRunMatchesGraph(workflowRunId, workflowId);
   if (status === 'paused' && matches) {
+    await syncTaskConfigsFromNodes(workflowRunId, workflowId);
     await resumePausedTasks(workflowRunId);
     return;
   }
   if (status === 'awaiting_decision' && matches) {
+    await syncTaskConfigsFromNodes(workflowRunId, workflowId);
     await db.update(tasks).set({ status: 'pending' }).where(and(eq(tasks.workflowRunId, workflowRunId), eq(tasks.status, 'awaiting_decision')));
     return;
   }
-  if (status === 'pending' && matches) return;
+  if (status === 'pending' && matches) {
+    await syncTaskConfigsFromNodes(workflowRunId, workflowId);
+    return;
+  }
   await rebuildWorkflowRunGraph(workflowRunId, workflowId);
 }
 
@@ -948,6 +1258,11 @@ function acceptanceCounts(input: Record<string, unknown>): Record<string, Record
   return counts;
 }
 
+function acceptanceHistoryEntries(input: Record<string, unknown>): Array<Record<string, unknown>> {
+  const raw = input.acceptanceHistory;
+  return Array.isArray(raw) ? raw.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item)) : [];
+}
+
 async function saveAcceptanceResult(
   task: typeof tasks.$inferSelect,
   verdict: 'pass' | 'reject' | 'unclear',
@@ -961,7 +1276,13 @@ async function saveAcceptanceResult(
     rule ? `规则：\n${rule}` : '',
     `判断：\n${body.trim() || (verdict === 'pass' ? '上游内容符合校验规则。' : '没有写出具体原因。')}`,
   ].filter(Boolean).join('\n\n');
-  const input = { ...jsonObject(task.inputJson), acceptanceResult: { verdict, label, detail } };
+  const entry = { verdict, label, detail, at: new Date().toISOString() };
+  const current = jsonObject(task.inputJson);
+  const input = {
+    ...current,
+    acceptanceResult: entry,
+    acceptanceHistory: [...acceptanceHistoryEntries(current), entry],
+  };
   task.inputJson = input;
   await db.update(tasks).set({ inputJson: input }).where(eq(tasks.id, task.id));
 }
@@ -1006,6 +1327,7 @@ async function sendAcceptanceBack(
   counts[checkerKey] = checkerCounts;
   const checkerInput = { ...jsonObject(checker.inputJson) };
   delete checkerInput.acceptanceWaived;
+  delete checkerInput.acceptanceResult;
   delete checkerInput.workspacePath;
   delete checkerInput.prompt;
   await db.update(tasks).set({ status: 'pending', inputJson: checkerInput }).where(eq(tasks.id, checker.id));
@@ -1015,7 +1337,10 @@ async function sendAcceptanceBack(
     workflowRunId,
     taskId: checker.id,
     type: 'acceptance.returned',
-    payloadJson: { message: `「${checker.name}」判定不合格，已退回给${items.map((item) => item.name).join('、')}。${items.map((item) => `${item.name}：${item.reason}`).join(' ')}` },
+    payloadJson: {
+      message: `「${checker.name}」判定不合格，已退回给${items.map((item) => item.name).join('、')}。${items.map((item) => `${item.name}：${item.reason}`).join(' ')}`,
+      returns: items.map((item) => ({ key: item.key, name: item.name, reason: item.reason })),
+    },
   });
 }
 
@@ -1049,15 +1374,18 @@ async function pauseAcceptance(
 async function waiveAcceptance(checkerTaskId: number, note = ''): Promise<void> {
   const task = (await db.select().from(tasks).where(eq(tasks.id, checkerTaskId)))[0];
   if (!task) return;
-  const previous = jsonObject(jsonObject(task.inputJson).acceptanceResult);
+  const current = jsonObject(task.inputJson);
+  const previous = jsonObject(current.acceptanceResult);
   const detail = [
     typeof previous.detail === 'string' && previous.detail.trim() ? previous.detail.trim() : '',
     note.trim() ? `人工批准：\n${note.trim()}` : '人工批准：已同意继续。',
   ].filter(Boolean).join('\n\n');
+  const entry = { verdict: 'pass' as const, label: '合格', detail, at: new Date().toISOString() };
   const input = {
-    ...jsonObject(task.inputJson),
+    ...current,
     acceptanceWaived: true,
-    acceptanceResult: { verdict: 'pass', label: '合格', detail },
+    acceptanceResult: entry,
+    acceptanceHistory: [...acceptanceHistoryEntries(current), entry],
   };
   await db.update(tasks).set({ status: 'pending', inputJson: input }).where(eq(tasks.id, task.id));
 }
@@ -1104,18 +1432,19 @@ async function reviewAcceptance(projectId: number, workflowId: number, workflowR
   const prompt = [
     '你负责验收直接交给你的内容，不要修改文件。',
     '只根据文件原文判断。交接说明是摘要，摘要里提到的章节如果原文里没有，就算不合格。',
-    `不合格条件：下面每一条都表示不合格。满足任意一条，就判定不合格，并在原因里写明命中了第几条。\n${rule}`,
+    `校验条件：下面每一条都表示不合格。满足任意一条，就判定不合格，并在原因里写明命中了第几条。\n${rule}`,
     `内容：\n${upstream}`,
-    '只按下面格式回复。',
+    '只按下面格式回复。第一行必须是单独的「合格」或「不合格」。',
     '全部合格时写：',
     '合格',
     '依据：对照规则和文件原文，说明为什么合格',
-    '合格时不要写出「不合格」。',
+    '合格时不要写出「不合格」这个词。',
     '有不合格时写：',
     '不合格',
     '退回：节点名称',
     '原因：命中了第几条，以及原文哪里不符合',
-    '几份内容不合格就写几组退回和原因。节点名称必须和上面的标题一致。',
+    '几份内容不合格就写几组退回和原因。节点名称必须和上面「###」标题完全一致。',
+    `可退回的节点名称：${providers.map((item) => item.party.name).join('、')}`,
   ].join('\n');
   const root = await managedWorkflowRoot(workflowId);
   await ensureDirectory(root);
@@ -1175,8 +1504,16 @@ async function reviewAcceptance(projectId: number, workflowId: number, workflowR
     }
     const checkerKey = recordKey(input) || `task-${task.id}`;
     const used = acceptanceCounts(await runInput(workflowRunId))[checkerKey] ?? {};
-    if (items.some((item) => (used[item.key] ?? 0) >= acceptanceLimit(input.maxRedos))) {
-      await saveAcceptanceResult(task, 'reject', checked, rule, `${reasonText}\n\n已达到最多退回次数，已停下来等你处理。`);
+    // 以节点当前配置为准，避免复用旧 task 时仍按默认 3 次退回
+    let configuredMaxRedos = input.maxRedos;
+    if (task.workflowNodeId) {
+      const node = (await db.select({ configJson: workflowNodes.configJson }).from(workflowNodes).where(eq(workflowNodes.id, task.workflowNodeId)).limit(1))[0];
+      const fromNode = jsonObject(node?.configJson).maxRedos;
+      if (fromNode !== undefined) configuredMaxRedos = fromNode;
+    }
+    const limit = acceptanceLimit(configuredMaxRedos);
+    if (items.some((item) => (used[item.key] ?? 0) >= limit)) {
+      await saveAcceptanceResult(task, 'reject', checked, rule, `${reasonText}\n\n已达到最多退回次数（${limit}），已停下来等你处理。`);
       await pauseAcceptance(projectId, workflowRunId, task, 'limit', items, text);
       return { status: 'awaiting' as const, taskId: task.id };
     }
@@ -1224,9 +1561,14 @@ async function executeWorkflowRun(workflowRunId: number, mode?: 'restart' | 'res
       return { status: currentRun?.status ?? 'failed', completedTaskIds };
     }
 
-    const runTasks = await db.select().from(tasks)
-      .where(eq(tasks.workflowRunId, workflowRunId))
-      .orderBy(asc(tasks.id));
+    const activePlan = (await db.select({ id: plans.id }).from(plans)
+      .where(and(eq(plans.workflowRunId, workflowRunId), eq(plans.status, 'active')))
+      .orderBy(desc(plans.version))
+      .limit(1))[0];
+    // Only the active plan's tasks participate in resume/restart scheduling — ignore cancelled copies from earlier plans
+    const runTasks = activePlan
+      ? await db.select().from(tasks).where(and(eq(tasks.workflowRunId, workflowRunId), eq(tasks.planId, activePlan.id))).orderBy(asc(tasks.id))
+      : await db.select().from(tasks).where(eq(tasks.workflowRunId, workflowRunId)).orderBy(asc(tasks.id));
     if (graphIsComplete(runTasks)) {
       await db.update(plans).set({ status: 'completed' }).where(and(eq(plans.workflowRunId, workflowRunId), eq(plans.status, 'active')));
       if (!(await finishRunIfStillRunning(workflowRunId, run.workflowId, 'completed', { completedAt: new Date() }))) {
@@ -1431,15 +1773,11 @@ async function executeAgentTask(projectId: number, workflowRunId: number, task: 
     command: typeof sessionInput.command === 'string' ? sessionInput.command : undefined,
     onEvent: (runtimeEvent) => {
       if (runtimeEvent.type === 'stdout' && typeof runtimeEvent.payload === 'string') output.push(runtimeEvent.payload);
-      void persistAndBroadcastEvent({
-        projectId,
-        workflowRunId,
-        taskId: task.id,
-        sessionId: session.id,
-        agentId,
-        type: `runtime.pi.${runtimeEvent.type}`,
-        payloadJson: runtimeEvent.payload,
-      });
+      void emitRuntimeEvent(
+        { projectId, workflowRunId, taskId: task.id, sessionId: session.id, agentId },
+        runtimeEvent.type,
+        runtimeEvent.payload,
+      );
     },
   });
   const completed = await piRuntime.wait(session.id);
@@ -1500,7 +1838,7 @@ async function replanWorkflowRun(workflowRunId: number, reason: string, definiti
     const workflow = (await db.select().from(workflows).where(eq(workflows.id, run.workflowId)))[0];
     if (!workflow) throw new OrviaError('Workflow not found', 'not_found', 404);
     nodeCapabilityLists = definitionNodes.map((node) => nodeCapabilityList(jsonObject(node)));
-    await assertCatalogKeys(workflow.projectId, nodeCapabilityLists.flat());
+    await assertProjectCatalogKeys(workflow.projectId, nodeCapabilityLists.flat());
   }
   const replanned = await db.transaction(async (tx) => {
     const oldPlans = await tx.select().from(plans).where(eq(plans.workflowRunId, workflowRunId)).orderBy(desc(plans.version));
@@ -1785,7 +2123,7 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       response.writeHead(204, {
         'access-control-allow-origin': config.webOrigin,
         'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
-        'access-control-allow-headers': 'content-type, authorization, x-orvia-tenant-id',
+        'access-control-allow-headers': 'content-type, authorization, x-orvia-tenant-id, x-orvia-filename',
       });
       return response.end();
     }
@@ -1814,6 +2152,111 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       } catch (error) {
         return sendJson(response, 503, { status: 'degraded', database: 'error', runtime: 'pi', error: error instanceof Error ? error.message : 'Database unavailable' });
       }
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/system/settings') {
+      const env = await readLocalEnv();
+      const databaseUrl = env.DATABASE_URL || config.databaseUrl;
+      const redisUrl = env.REDIS_URL || config.redisUrl;
+      const piCommand = env.PI_COMMAND || config.piCommand;
+      const mysql = parseMysqlUrl(databaseUrl);
+      const redis = parseRedisUrl(redisUrl);
+      const [piStatus, mysqlStatus, redisStatus] = await Promise.all([
+        probePi(piCommand),
+        probeMysql(databaseUrl),
+        probeRedis(redisUrl),
+      ]);
+      return sendJson(response, 200, {
+        storage: 'local-env',
+        path: '.env',
+        note: '连接信息只保存在本机 .env，不会写入数据库或 Git。',
+        pi: {
+          command: piCommand,
+          status: piStatus.status,
+          version: piStatus.version,
+          message: piStatus.message,
+        },
+        mysql: {
+          host: mysql.host,
+          port: mysql.port,
+          user: mysql.user,
+          database: mysql.database,
+          passwordSet: Boolean(mysql.password),
+          passwordMasked: maskSecret(mysql.password),
+          status: mysqlStatus.status,
+          message: mysqlStatus.message,
+          latencyMs: mysqlStatus.latencyMs,
+        },
+        redis: {
+          host: redis.host,
+          port: redis.port,
+          passwordSet: Boolean(redis.password),
+          passwordMasked: maskSecret(redis.password),
+          displayUrl: redisDisplayUrl(redisUrl),
+          status: redisStatus.status,
+          message: redisStatus.message,
+          latencyMs: redisStatus.latencyMs,
+        },
+      });
+    }
+
+    if (request.method === 'PUT' && url.pathname === '/api/system/settings') {
+      const body = await readJson(request);
+      const env = await readLocalEnv();
+      const currentMysql = parseMysqlUrl(env.DATABASE_URL || config.databaseUrl);
+      const currentRedis = parseRedisUrl(env.REDIS_URL || config.redisUrl);
+      const mysqlPassword = typeof body.mysqlPassword === 'string'
+        ? body.mysqlPassword
+        : currentMysql.password;
+      const redisPassword = typeof body.redisPassword === 'string'
+        ? body.redisPassword
+        : currentRedis.password;
+      const mysqlUrl = buildMysqlUrl({
+        host: typeof body.mysqlHost === 'string' ? body.mysqlHost : currentMysql.host,
+        port: typeof body.mysqlPort === 'string' ? body.mysqlPort : currentMysql.port,
+        user: typeof body.mysqlUser === 'string' ? body.mysqlUser : currentMysql.user,
+        password: mysqlPassword,
+        database: typeof body.mysqlDatabase === 'string' ? body.mysqlDatabase : currentMysql.database,
+      });
+      const redisUrl = buildRedisUrl({
+        host: typeof body.redisHost === 'string' ? body.redisHost : currentRedis.host,
+        port: typeof body.redisPort === 'string' ? body.redisPort : currentRedis.port,
+        password: redisPassword,
+      });
+      const piCommand = typeof body.piCommand === 'string' && body.piCommand.trim()
+        ? body.piCommand.trim()
+        : (env.PI_COMMAND || config.piCommand);
+
+      const [mysqlStatus, redisStatus, piStatus] = await Promise.all([
+        probeMysql(mysqlUrl),
+        probeRedis(redisUrl),
+        probePi(piCommand),
+      ]);
+      if (mysqlStatus.status !== 'ok') {
+        return sendJson(response, 400, { error: `MySQL 不可用：${mysqlStatus.message}`, mysql: mysqlStatus });
+      }
+      if (redisStatus.status !== 'ok') {
+        return sendJson(response, 400, { error: `Redis 不可用：${redisStatus.message}`, redis: redisStatus });
+      }
+
+      await writeLocalEnv({
+        DATABASE_URL: mysqlUrl,
+        REDIS_URL: redisUrl,
+        PI_COMMAND: piCommand,
+      });
+      process.env.DATABASE_URL = mysqlUrl;
+      process.env.REDIS_URL = redisUrl;
+      process.env.PI_COMMAND = piCommand;
+
+      return sendJson(response, 200, {
+        status: 'saved',
+        storage: 'local-env',
+        restartRequired: true,
+        message: '已写入本机 .env。Pi 命令立即生效；MySQL / Redis 需重启 API 进程后完全切换。',
+        pi: piStatus,
+        mysql: mysqlStatus,
+        redis: redisStatus,
+      });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/auth/login') {
@@ -2008,7 +2451,20 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
     }
 
     if (request.method === 'GET' && url.pathname === '/api/projects') {
-      const rows = await db.select().from(projects).where(eq(projects.tenantId, auth.tenantId)).orderBy(asc(projects.name));
+      const rows = await db.select({
+        id: projects.id,
+        tenantId: projects.tenantId,
+        name: projects.name,
+        description: projects.description,
+        status: projects.status,
+        createdAt: projects.createdAt,
+        updatedAt: projects.updatedAt,
+        workflowCount: sql<number>`coalesce(count(${workflows.id}), 0)`.mapWith(Number),
+      }).from(projects)
+        .leftJoin(workflows, eq(workflows.projectId, projects.id))
+        .where(eq(projects.tenantId, auth.tenantId))
+        .groupBy(projects.id)
+        .orderBy(desc(projects.createdAt), asc(projects.name));
       return sendJson(response, 200, { data: rows });
     }
 
@@ -2022,45 +2478,54 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
         description: typeof body.description === 'string' ? body.description : undefined,
       });
       const projectId = result[0].insertId;
-      await ensureProjectCapabilities(projectId);
-      return sendJson(response, 201, { id: projectId, name, tenantId: auth.tenantId });
+      await ensureTenantCapabilities(auth.tenantId);
+      return sendJson(response, 201, { id: projectId, name, tenantId: auth.tenantId, workflowCount: 0 });
+    }
+
+    const projectDetailMatch = url.pathname.match(/^\/api\/projects\/(\d+)$/);
+    if ((request.method === 'PATCH' || request.method === 'PUT') && projectDetailMatch) {
+      const projectId = Number(projectDetailMatch[1]);
+      const body = await readJson(request);
+      const project = (await db.select().from(projects).where(eq(projects.id, projectId)).limit(1))[0];
+      if (!project || project.tenantId !== auth.tenantId) return sendJson(response, 404, { error: 'Project not found' });
+      const name = requiredString(body, 'name');
+      if (!name) return sendJson(response, 400, { error: 'name is required' });
+      await db.update(projects).set({
+        name,
+        description: typeof body.description === 'string' ? body.description : project.description,
+      }).where(eq(projects.id, projectId));
+      return sendJson(response, 200, { id: projectId, name });
     }
 
     if (request.method === 'GET' && url.pathname === '/api/capabilities') {
-      const projectId = queryId(url, 'projectId');
-      if (!projectId) return sendJson(response, 400, { error: 'projectId is required' });
-      const project = (await db.select().from(projects).where(eq(projects.id, projectId)))[0];
-      if (!project || project.tenantId !== auth.tenantId) return sendJson(response, 404, { error: 'Project not found' });
-      const rows = await ensureProjectCapabilities(projectId);
+      if (!auth) return sendJson(response, 401, { error: 'Unauthorized' });
+      const rows = await ensureTenantCapabilities(auth.tenantId);
       return sendJson(response, 200, { data: rows });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/capabilities') {
+      if (!auth) return sendJson(response, 401, { error: 'Unauthorized' });
       const body = await readJson(request);
-      const projectId = typeof body.projectId === 'number' ? body.projectId : Number(body.projectId);
       const key = typeof body.key === 'string' ? normalizeCapabilityKey(body.key) : undefined;
       const name = requiredString(body, 'name') ?? key;
-      if (!Number.isInteger(projectId) || projectId < 1 || !key || !name) {
+      if (!key || !name) {
         return sendJson(response, 400, { error: '请填写合法的能力标识和中文名称' });
       }
-      const project = (await db.select().from(projects).where(eq(projects.id, projectId)))[0];
-      if (!project || project.tenantId !== auth.tenantId) return sendJson(response, 404, { error: 'Project not found' });
-      await ensureProjectCapabilities(projectId);
-      const duplicate = (await db.select().from(capabilities).where(and(eq(capabilities.projectId, projectId), eq(capabilities.key, key))))[0];
+      await ensureTenantCapabilities(auth.tenantId);
+      const duplicate = (await db.select().from(capabilities).where(and(eq(capabilities.tenantId, auth.tenantId), eq(capabilities.key, key))))[0];
       if (duplicate) return sendJson(response, 400, { error: '这个能力标识已经在目录里' });
       const description = typeof body.description === 'string' ? body.description.trim() : '';
-      const result = await db.insert(capabilities).values({ projectId, key, name, description: description || null });
-      return sendJson(response, 201, { id: result[0].insertId, projectId, key, name });
+      const result = await db.insert(capabilities).values({ tenantId: auth.tenantId, key, name, description: description || null });
+      return sendJson(response, 201, { id: result[0].insertId, tenantId: auth.tenantId, key, name });
     }
 
     const capabilityDetailMatch = url.pathname.match(/^\/api\/capabilities\/(\d+)$/);
     if ((request.method === 'PATCH' || request.method === 'PUT') && capabilityDetailMatch) {
+      if (!auth) return sendJson(response, 401, { error: 'Unauthorized' });
       const capabilityId = Number(capabilityDetailMatch[1]);
       const body = await readJson(request);
       const existing = (await db.select().from(capabilities).where(eq(capabilities.id, capabilityId)))[0];
-      if (!existing) return sendJson(response, 404, { error: 'Capability not found' });
-      const project = (await db.select().from(projects).where(eq(projects.id, existing.projectId)))[0];
-      if (!project || project.tenantId !== auth.tenantId) return sendJson(response, 404, { error: 'Capability not found' });
+      if (!existing || existing.tenantId !== auth.tenantId) return sendJson(response, 404, { error: 'Capability not found' });
       const name = requiredString(body, 'name') ?? existing.name;
       if (!name) return sendJson(response, 400, { error: '请填写中文名称' });
       const description = typeof body.description === 'string' ? body.description.trim() : existing.description;
@@ -2105,7 +2570,7 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
         }
         workflowId = parsed;
       }
-      const capabilityKeys = await assertCatalogKeys(projectId, collectCapabilityKeys(body.capabilitiesJson));
+      const capabilityKeys = await assertProjectCatalogKeys(projectId, collectCapabilityKeys(body.capabilitiesJson));
       const result = await db.insert(agents).values({
         projectId,
         workflowId,
@@ -2128,7 +2593,7 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       if (!name) return sendJson(response, 400, { error: 'name is required' });
       const capabilityKeys = body.capabilitiesJson === undefined
         ? undefined
-        : await assertCatalogKeys(existing.projectId, collectCapabilityKeys(body.capabilitiesJson));
+        : await assertProjectCatalogKeys(existing.projectId, collectCapabilityKeys(body.capabilitiesJson));
       await db.update(agents).set({
         name,
         capabilitiesJson: capabilityKeys === undefined ? existing.capabilitiesJson : capabilityKeys,
@@ -2223,10 +2688,26 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
     }
 
     if (request.method === 'GET' && url.pathname === '/api/workflows') {
+      if (!auth) return sendJson(response, 401, { error: 'Unauthorized' });
       const projectId = queryId(url, 'projectId');
-      const rows = projectId
-        ? await db.select().from(workflows).where(eq(workflows.projectId, projectId)).orderBy(asc(workflows.name))
-        : await db.select().from(workflows).orderBy(asc(workflows.name));
+      const rows = await db.select({
+        id: workflows.id,
+        projectId: workflows.projectId,
+        projectName: projects.name,
+        name: workflows.name,
+        version: workflows.version,
+        definitionJson: workflows.definitionJson,
+        status: workflows.status,
+        runStatus: workflows.runStatus,
+        currentVersionId: workflows.currentVersionId,
+        createdAt: workflows.createdAt,
+        updatedAt: workflows.updatedAt,
+      }).from(workflows)
+        .innerJoin(projects, eq(projects.id, workflows.projectId))
+        .where(projectId
+          ? and(eq(projects.tenantId, auth.tenantId), eq(workflows.projectId, projectId))
+          : eq(projects.tenantId, auth.tenantId))
+        .orderBy(desc(workflows.updatedAt), asc(workflows.name));
       return sendJson(response, 200, { data: rows });
     }
 
@@ -2335,8 +2816,10 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       let handedOff = false;
       try {
         const created = await db.transaction(async (tx) => {
-          await tx.insert(nodeMessages).values({ workflowId, nodeKey, role: 'user', content, status: 'completed' });
-          const assistant = await tx.insert(nodeMessages).values({ workflowId, nodeKey, role: 'assistant', content: '', status: 'streaming' });
+          const owner = (await tx.select({ currentVersionId: workflows.currentVersionId }).from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
+          const workflowVersionId = owner?.currentVersionId ?? undefined;
+          await tx.insert(nodeMessages).values({ workflowId, workflowVersionId, nodeKey, role: 'user', content, status: 'completed' });
+          const assistant = await tx.insert(nodeMessages).values({ workflowId, workflowVersionId, nodeKey, role: 'assistant', content: '', status: 'streaming' });
           const runtimeSession = await tx.insert(sessions).values({
             contextType: 'chat',
             contextId: workflowId,
@@ -2368,6 +2851,7 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       const workflowId = Number(workflowNodesMatch[1]);
       const running = (await db.select({ id: workflowRuns.id }).from(workflowRuns).where(and(eq(workflowRuns.workflowId, workflowId), eq(workflowRuns.status, 'running'))).limit(1))[0];
       if (!running) await ensureWorkflowTerminals(workflowId);
+      await ensureLegacyWorkflowVersion(workflowId).catch(() => undefined);
       const workflow = (await db.select({ name: workflows.name, definitionJson: workflows.definitionJson }).from(workflows).where(eq(workflows.id, workflowId)))[0];
       const rows = await db.select().from(workflowNodes)
         .where(eq(workflowNodes.workflowId, workflowId))
@@ -2379,6 +2863,76 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       return sendJson(response, 200, { data: rows, edges, loops: loopsFromDefinition(workflow?.definitionJson), root });
     }
 
+    const workflowVersionsMatch = url.pathname.match(/^\/api\/workflows\/(\d+)\/versions$/);
+    if (request.method === 'GET' && workflowVersionsMatch) {
+      const workflowId = Number(workflowVersionsMatch[1]);
+      const workflow = (await db.select().from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
+      if (!workflow) return sendJson(response, 404, { error: 'Workflow not found' });
+      const project = (await db.select().from(projects).where(eq(projects.id, workflow.projectId)).limit(1))[0];
+      if (!auth || !project || project.tenantId !== auth.tenantId) return sendJson(response, 404, { error: 'Workflow not found' });
+      await ensureLegacyWorkflowVersion(workflowId).catch(() => undefined);
+      const refreshed = (await db.select({ currentVersionId: workflows.currentVersionId, version: workflows.version }).from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
+      const rows = await db.select({
+        id: workflowVersions.id,
+        version: workflowVersions.version,
+        seq: workflowVersions.seq,
+        name: workflowVersions.name,
+        publishedAt: workflowVersions.publishedAt,
+      }).from(workflowVersions)
+        .where(eq(workflowVersions.workflowId, workflowId))
+        .orderBy(desc(workflowVersions.seq))
+        .limit(MAX_WORKFLOW_VERSIONS);
+      return sendJson(response, 200, {
+        data: rows,
+        currentVersionId: refreshed?.currentVersionId ?? null,
+        currentVersion: refreshed?.version ?? workflow.version,
+      });
+    }
+
+    const workflowPublishMatch = url.pathname.match(/^\/api\/workflows\/(\d+)\/publish$/);
+    if (request.method === 'POST' && workflowPublishMatch) {
+      const workflowId = Number(workflowPublishMatch[1]);
+      const body = await readJson(request);
+      const workflow = (await db.select().from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
+      if (!workflow) return sendJson(response, 404, { error: 'Workflow not found' });
+      const project = (await db.select().from(projects).where(eq(projects.id, workflow.projectId)).limit(1))[0];
+      if (!auth || !project || project.tenantId !== auth.tenantId) return sendJson(response, 404, { error: 'Workflow not found' });
+      const name = requiredString(body, 'name') ?? workflow.name;
+      const definitionJson = body.definitionJson === undefined ? workflow.definitionJson : body.definitionJson;
+      try {
+        const published = await publishWorkflowVersion(workflowId, { name, definitionJson });
+        return sendJson(response, 200, {
+          id: workflowId,
+          name,
+          version: published.version,
+          versionId: published.versionId,
+          seq: published.seq,
+          status: 'published',
+          pruned: published.pruned,
+        });
+      } catch (error) {
+        if (error instanceof OrviaError) return sendJson(response, error.statusCode, { error: error.message });
+        throw error;
+      }
+    }
+
+    const workflowActivateMatch = url.pathname.match(/^\/api\/workflows\/(\d+)\/versions\/(\d+)\/activate$/);
+    if (request.method === 'POST' && workflowActivateMatch) {
+      const workflowId = Number(workflowActivateMatch[1]);
+      const versionId = Number(workflowActivateMatch[2]);
+      const workflow = (await db.select().from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
+      if (!workflow) return sendJson(response, 404, { error: 'Workflow not found' });
+      const project = (await db.select().from(projects).where(eq(projects.id, workflow.projectId)).limit(1))[0];
+      if (!auth || !project || project.tenantId !== auth.tenantId) return sendJson(response, 404, { error: 'Workflow not found' });
+      try {
+        const activated = await activateWorkflowVersion(workflowId, versionId);
+        return sendJson(response, 200, { id: workflowId, versionId, version: activated.version, status: 'activated' });
+      } catch (error) {
+        if (error instanceof OrviaError) return sendJson(response, error.statusCode, { error: error.message });
+        throw error;
+      }
+    }
+
     const workflowDetailMatch = url.pathname.match(/^\/api\/workflows\/(\d+)$/);
     if ((request.method === 'PATCH' || request.method === 'PUT') && workflowDetailMatch) {
       const workflowId = Number(workflowDetailMatch[1]);
@@ -2387,25 +2941,40 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       if (!workflow) return sendJson(response, 404, { error: 'Workflow not found' });
       const project = (await db.select().from(projects).where(eq(projects.id, workflow.projectId)))[0];
       if (!auth || !project || project.tenantId !== auth.tenantId) return sendJson(response, 404, { error: 'Workflow not found' });
-      const running = (await db.select({ id: workflowRuns.id }).from(workflowRuns).where(and(eq(workflowRuns.workflowId, workflowId), eq(workflowRuns.status, 'running'))).limit(1))[0];
-      if (running) return sendJson(response, 409, { error: '请先停止正在运行的 Run，再修改 Agent' });
+      const running = (await db.select({ id: workflowRuns.id, status: workflowRuns.status }).from(workflowRuns).where(eq(workflowRuns.workflowId, workflowId)).limit(1))[0];
+      // 仅运行中禁止改图；暂停/等待决策时仍可保存节点位置与大小
+      if (running?.status === 'running') return sendJson(response, 409, { error: '请先停止正在运行的 Run，再修改 Agent' });
+      // 发布请走 POST /publish；这里只保存当前工作副本，不写版本历史
       const name = requiredString(body, 'name') ?? workflow.name;
-      const version = requiredString(body, 'version') ?? workflow.version;
-      const nextStatus = body.status === 'published' || workflow.status === 'published' ? 'published' : 'draft';
+      const nextStatus = body.status === 'draft'
+        ? 'draft'
+        : (body.status === 'published' || workflow.status === 'published' ? 'published' : 'draft');
       const definitionJson = body.definitionJson === undefined ? workflow.definitionJson : body.definitionJson;
       const prepared = prepareWorkflowDefinition(definitionJson, nextStatus === 'published');
       if (nextStatus === 'published' && prepared.definitionNodes.length === 0) {
         return sendJson(response, 400, { error: '请至少添加一个节点' });
       }
-      await assertCatalogKeys(workflow.projectId, prepared.nodeCapabilityLists.flat());
+      await assertProjectCatalogKeys(workflow.projectId, prepared.nodeCapabilityLists.flat());
       await db.transaction(async (tx) => {
-        await tx.update(workflows).set({ name, version, definitionJson, status: nextStatus }).where(eq(workflows.id, workflowId));
+        await tx.update(workflows).set({
+          name,
+          version: workflow.version,
+          definitionJson,
+          status: nextStatus,
+        }).where(eq(workflows.id, workflowId));
         if (body.definitionJson !== undefined || nextStatus === 'published') {
           await insertWorkflowGraph(tx, workflowId, prepared, true, nextStatus === 'published');
         }
       });
       await managedWorkflowRoot(workflowId);
-      return sendJson(response, 200, { id: workflowId, name, version, status: nextStatus, nodeCount: prepared.definitionNodes.length, edgeCount: prepared.definitionEdges.length });
+      return sendJson(response, 200, {
+        id: workflowId,
+        name,
+        version: workflow.version,
+        status: nextStatus,
+        nodeCount: prepared.definitionNodes.length,
+        edgeCount: prepared.definitionEdges.length,
+      });
     }
 
     if (request.method === 'DELETE' && workflowDetailMatch) {
@@ -2434,9 +3003,13 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       if (!Number.isInteger(projectId) || projectId < 1 || !name) {
         return sendJson(response, 400, { error: 'projectId and name are required' });
       }
+      const project = (await db.select().from(projects).where(eq(projects.id, projectId)).limit(1))[0];
+      if (!auth || !project || project.tenantId !== auth.tenantId) {
+        return sendJson(response, 404, { error: 'Project not found' });
+      }
       const status = body.status === 'draft' ? 'draft' : 'published';
       const prepared = prepareWorkflowDefinition(body.definitionJson, status === 'published');
-      await assertCatalogKeys(projectId, prepared.nodeCapabilityLists.flat());
+      await assertProjectCatalogKeys(projectId, prepared.nodeCapabilityLists.flat());
       const created = await db.transaction(async (tx) => {
         const result = await tx.insert(workflows).values({
           projectId,
@@ -2449,7 +3022,11 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
         const graph = await insertWorkflowGraph(tx, workflowId, prepared, false, status === 'published');
         return { workflowId, ...graph };
       });
-      return sendJson(response, 201, { id: created.workflowId, projectId, name, version, status, nodeCount: created.nodeCount, edgeCount: created.edgeCount });
+      await ensureWorkflowTerminals(created.workflowId);
+      const nodes = await db.select({ id: workflowNodes.id }).from(workflowNodes).where(eq(workflowNodes.workflowId, created.workflowId));
+      const edges = await db.select({ id: workflowEdges.id }).from(workflowEdges).where(eq(workflowEdges.workflowId, created.workflowId));
+      await managedWorkflowRoot(created.workflowId);
+      return sendJson(response, 201, { id: created.workflowId, projectId, name, version, status, nodeCount: nodes.length, edgeCount: edges.length });
     }
 
     const workflowRunSummaryMatch = url.pathname.match(/^\/api\/workflow-runs\/(\d+)\/summary$/);
@@ -2481,7 +3058,10 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
         db.select().from(plans).where(eq(plans.workflowRunId, workflowRunId)).orderBy(asc(plans.version)),
         db.select().from(checkpoints).where(eq(checkpoints.workflowRunId, workflowRunId)).orderBy(asc(checkpoints.id)),
         db.select().from(decisions).where(eq(decisions.workflowRunId, workflowRunId)).orderBy(asc(decisions.id)),
-        db.select().from(events).where(eq(events.workflowRunId, workflowRunId)).orderBy(asc(events.id)),
+        db.select().from(events).where(and(
+          eq(events.workflowRunId, workflowRunId),
+          notInArray(events.type, EPHEMERAL_EVENT_TYPES),
+        )).orderBy(asc(events.id)),
       ]);
       return sendJson(response, 200, { data: { ...run, plans: runPlans, tasks: runTasks, sessions: runSessions, checkpoints: runCheckpoints, decisions: runDecisions, events: runEvents } });
     }
@@ -2492,11 +3072,22 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       if (!Number.isInteger(workflowId) || workflowId < 1) {
         return sendJson(response, 400, { error: 'workflowId is required' });
       }
-      const workflowRows = await db.select({ projectId: workflows.projectId }).from(workflows).where(eq(workflows.id, workflowId));
+      const workflowRows = await db.select({
+        projectId: workflows.projectId,
+        currentVersionId: workflows.currentVersionId,
+      }).from(workflows).where(eq(workflows.id, workflowId));
       const workflow = workflowRows[0];
       if (!workflow) return sendJson(response, 404, { error: 'Workflow not found' });
+      await ensureLegacyWorkflowVersion(workflowId).catch(() => undefined);
+      const versionOwner = (await db.select({ currentVersionId: workflows.currentVersionId }).from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
+      const workflowVersionId = versionOwner?.currentVersionId ?? workflow.currentVersionId ?? undefined;
       const existingRun = (await db.select().from(workflowRuns).where(eq(workflowRuns.workflowId, workflowId)).limit(1))[0];
-      if (existingRun) return sendJson(response, 200, { id: existingRun.id, workflowId, status: existingRun.status, existing: true });
+      if (existingRun) {
+        if (workflowVersionId && existingRun.workflowVersionId !== workflowVersionId) {
+          await db.update(workflowRuns).set({ workflowVersionId }).where(eq(workflowRuns.id, existingRun.id));
+        }
+        return sendJson(response, 200, { id: existingRun.id, workflowId, status: existingRun.status, existing: true });
+      }
       const nodes = await db.select().from(workflowNodes).where(eq(workflowNodes.workflowId, workflowId)).orderBy(asc(workflowNodes.id));
       if (nodes.length === 0) return sendJson(response, 400, { error: 'Workflow has no executable nodes' });
       const idempotencyKey = requiredString(body, 'idempotencyKey');
@@ -2508,6 +3099,7 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       const createdRun = await db.transaction(async (tx) => {
         const result = await tx.insert(workflowRuns).values({
           workflowId,
+          workflowVersionId,
           status: 'pending',
           idempotencyKey,
           inputJson: body.inputJson,
@@ -2614,7 +3206,10 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       const sessionId = Number(sessionDetailMatch[1]);
       const session = (await db.select().from(sessions).where(eq(sessions.id, sessionId)))[0];
       if (!session) return sendJson(response, 404, { error: 'Session not found' });
-      const sessionEvents = await db.select().from(events).where(eq(events.sessionId, sessionId)).orderBy(asc(events.id));
+      const sessionEvents = await db.select().from(events).where(and(
+        eq(events.sessionId, sessionId),
+        notInArray(events.type, EPHEMERAL_EVENT_TYPES),
+      )).orderBy(asc(events.id));
       return sendJson(response, 200, { data: { ...session, events: sessionEvents } });
     }
 
@@ -2741,7 +3336,12 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       if (!mode && run.status !== 'pending') {
         return sendJson(response, 400, { error: '请选择从头开始，或从当前暂停的 Agent 继续' });
       }
-      if (mode === 'resume') await assertResumePossible(workflowRunId, run.workflowId);
+      if (mode === 'resume') {
+        if (run.status === 'awaiting_decision') {
+          return sendJson(response, 409, { error: '当前在等待确认。请先在面板上处理待确认，或选择从头开始。' });
+        }
+        await assertResumePossible(workflowRunId, run.workflowId);
+      }
       requireRunTransition(run.status, 'running');
       if (executingWorkflowRuns.has(workflowRunId)) {
         return sendJson(response, 409, { error: '当前 Run 正在运行，请先停止后再执行' });
@@ -3022,8 +3622,8 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
         ? await db.select({ value: count() }).from(checkpoints).where(and(eq(checkpoints.projectId, projectId), eq(checkpoints.status, 'pending')))
         : await db.select({ value: count() }).from(checkpoints).where(eq(checkpoints.status, 'pending'));
       const recentEvents = projectId
-        ? await db.select().from(events).where(eq(events.projectId, projectId)).orderBy(desc(events.id)).limit(20)
-        : await db.select().from(events).orderBy(desc(events.id)).limit(20);
+        ? await db.select().from(events).where(and(eq(events.projectId, projectId), notInArray(events.type, EPHEMERAL_EVENT_TYPES))).orderBy(desc(events.id)).limit(20)
+        : await db.select().from(events).where(notInArray(events.type, EPHEMERAL_EVENT_TYPES)).orderBy(desc(events.id)).limit(20);
       return sendJson(response, 200, {
         projectId: projectId ?? null,
         counts: {
@@ -3113,12 +3713,14 @@ server.on('upgrade', (request, socket) => {
 });
 async function startServer() {
   await ensureTables();
+  await migrateCapabilitiesToTenant();
   await repairSchema();
   await repairEnums();
   await backfillWorkflowRunStatus();
   const schemaIssues = await schemaIntegrityIssues();
   if (schemaIssues.length > 0) throw new Error(`Database schema is incomplete: ${schemaIssues.join(', ')}`);
   await bootstrapTenancy();
+  await ensureTenantCapabilities(await defaultTenantId());
   await connectRedis();
   await redisRuntime().subscribe('orvia:events', (message) => {
     const envelope = JSON.parse(message) as { projectId: number };
