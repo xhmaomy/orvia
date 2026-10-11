@@ -89,14 +89,14 @@ export const models = mysqlTable('ov_models', {
 
 export const capabilities = mysqlTable('ov_capabilities', {
   id: int('id').autoincrement().primaryKey(),
-  projectId: int('project_id').notNull().references(() => projects.id),
+  tenantId: int('tenant_id').notNull().references(() => tenants.id),
   key: varchar('capability_key', { length: 120 }).notNull(),
   name: varchar('name', { length: 160 }).notNull(),
   description: text('description'),
   createdAt: timestamp('created_at').default(sql`CURRENT_TIMESTAMP`).notNull(),
   updatedAt: timestamp('updated_at').default(sql`CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
 }, (table) => ({
-  projectKeyUnique: uniqueIndex('capabilities_project_key_unique').on(table.projectId, table.key),
+  tenantKeyUnique: uniqueIndex('capabilities_tenant_key_unique').on(table.tenantId, table.key),
 }));
 
 export const agents = mysqlTable('ov_agents', {
@@ -131,12 +131,26 @@ export const workflows = mysqlTable('ov_workflows', {
   projectId: int('project_id').notNull().references(() => projects.id),
   name: varchar('name', { length: 160 }).notNull(),
   version: varchar('version', { length: 40 }).notNull(),
+  currentVersionId: int('current_version_id'),
   definitionJson: json('definition_json'),
   status: status.notNull().default('draft'),
   runStatus: mysqlEnum('run_status', ['pending', 'running', 'paused', 'awaiting_decision', 'completed', 'failed', 'cancelled']),
   createdAt: timestamp('created_at').default(sql`CURRENT_TIMESTAMP`).notNull(),
   updatedAt: timestamp('updated_at').default(sql`CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
 });
+
+export const workflowVersions = mysqlTable('ov_workflow_versions', {
+  id: int('id').autoincrement().primaryKey(),
+  workflowId: int('workflow_id').notNull().references(() => workflows.id),
+  version: varchar('version', { length: 40 }).notNull(),
+  seq: int('seq').notNull(),
+  name: varchar('name', { length: 160 }).notNull(),
+  definitionJson: json('definition_json').notNull(),
+  publishedAt: timestamp('published_at').default(sql`CURRENT_TIMESTAMP`).notNull(),
+}, (table) => ({
+  versionUnique: uniqueIndex('workflow_versions_workflow_version_unique').on(table.workflowId, table.version),
+  seqUnique: uniqueIndex('workflow_versions_workflow_seq_unique').on(table.workflowId, table.seq),
+}));
 
 export const workflowNodes = mysqlTable('ov_workflow_nodes', {
   id: int('id').autoincrement().primaryKey(),
@@ -162,6 +176,7 @@ export const workflowEdges = mysqlTable('ov_workflow_edges', {
 export const workflowRuns = mysqlTable('ov_workflow_runs', {
   id: int('id').autoincrement().primaryKey(),
   workflowId: int('workflow_id').notNull().references(() => workflows.id),
+  workflowVersionId: int('workflow_version_id'),
   status: mysqlEnum('run_status', ['pending', 'running', 'paused', 'awaiting_decision', 'completed', 'failed', 'cancelled']).notNull().default('pending'),
   currentPlanVersion: int('current_plan_version').notNull().default(1),
   idempotencyKey: varchar('idempotency_key', { length: 160 }),
@@ -236,6 +251,7 @@ export const checkpoints = mysqlTable('ov_checkpoints', {
 export const nodeMessages = mysqlTable('ov_node_messages', {
   id: int('id').autoincrement().primaryKey(),
   workflowId: int('workflow_id').notNull().references(() => workflows.id),
+  workflowVersionId: int('workflow_version_id'),
   nodeKey: varchar('node_key', { length: 160 }).notNull(),
   sessionId: int('session_id').references(() => sessions.id),
   role: mysqlEnum('node_message_role', ['user', 'assistant']).notNull(),
@@ -245,19 +261,23 @@ export const nodeMessages = mysqlTable('ov_node_messages', {
   createdAt: timestamp('created_at').default(sql`CURRENT_TIMESTAMP`).notNull(),
 }, (table) => ({
   workflowNodeKey: index('node_messages_workflow_key').on(table.workflowId, table.nodeKey),
+  nodeMessagesVersionIdx: index('node_messages_version_idx').on(table.workflowVersionId),
 }));
 
 export const events = mysqlTable('ov_events', {
   id: int('id').autoincrement().primaryKey(),
   projectId: int('project_id').notNull().references(() => projects.id),
   workflowRunId: int('workflow_run_id').references(() => workflowRuns.id),
+  workflowVersionId: int('workflow_version_id'),
   taskId: int('task_id').references(() => tasks.id),
   sessionId: int('session_id').references(() => sessions.id),
   agentId: int('agent_id').references(() => agents.id),
   type: varchar('type', { length: 120 }).notNull(),
   payloadJson: json('payload_json'),
   createdAt: timestamp('created_at').default(sql`CURRENT_TIMESTAMP`).notNull(),
-});
+}, (table) => ({
+  eventsVersionIdx: index('events_version_idx').on(table.workflowVersionId),
+}));
 
 export const decisions = mysqlTable('ov_decisions', {
   id: int('id').autoincrement().primaryKey(),

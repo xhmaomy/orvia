@@ -46,15 +46,15 @@ const statements = [
   )`,
   `CREATE TABLE IF NOT EXISTS ov_capabilities (
     id int NOT NULL AUTO_INCREMENT,
-    project_id int NOT NULL,
+    tenant_id int NOT NULL,
     capability_key varchar(120) NOT NULL,
     name varchar(160) NOT NULL,
     description text,
     created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
-    UNIQUE KEY capabilities_project_key_unique (project_id, capability_key),
-    CONSTRAINT ov_capabilities_project_fk FOREIGN KEY (project_id) REFERENCES ov_projects (id)
+    UNIQUE KEY capabilities_tenant_key_unique (tenant_id, capability_key),
+    CONSTRAINT ov_capabilities_tenant_fk FOREIGN KEY (tenant_id) REFERENCES ov_tenants (id)
   )`,
   `CREATE TABLE IF NOT EXISTS ov_model_providers (
     id int NOT NULL AUTO_INCREMENT,
@@ -89,6 +89,7 @@ const statements = [
     project_id int NOT NULL,
     name varchar(160) NOT NULL,
     version varchar(40) NOT NULL,
+    current_version_id int,
     definition_json json,
     status enum('active','inactive','draft','published','archived') NOT NULL DEFAULT 'draft',
     run_status enum('pending','running','paused','awaiting_decision','completed','failed','cancelled'),
@@ -96,6 +97,19 @@ const statements = [
     updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     CONSTRAINT ov_workflows_project_fk FOREIGN KEY (project_id) REFERENCES ov_projects (id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS ov_workflow_versions (
+    id int NOT NULL AUTO_INCREMENT,
+    workflow_id int NOT NULL,
+    version varchar(40) NOT NULL,
+    seq int NOT NULL,
+    name varchar(160) NOT NULL,
+    definition_json json NOT NULL,
+    published_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY workflow_versions_workflow_version_unique (workflow_id, version),
+    UNIQUE KEY workflow_versions_workflow_seq_unique (workflow_id, seq),
+    CONSTRAINT ov_workflow_versions_workflow_fk FOREIGN KEY (workflow_id) REFERENCES ov_workflows (id)
   )`,
   `CREATE TABLE IF NOT EXISTS ov_agents (
     id int NOT NULL AUTO_INCREMENT,
@@ -153,6 +167,7 @@ const statements = [
   `CREATE TABLE IF NOT EXISTS ov_workflow_runs (
     id int NOT NULL AUTO_INCREMENT,
     workflow_id int NOT NULL,
+    workflow_version_id int,
     run_status enum('pending','running','paused','awaiting_decision','completed','failed','cancelled') NOT NULL DEFAULT 'pending',
     current_plan_version int NOT NULL DEFAULT 1,
     idempotency_key varchar(160),
@@ -237,6 +252,7 @@ const statements = [
   `CREATE TABLE IF NOT EXISTS ov_node_messages (
     id int NOT NULL AUTO_INCREMENT,
     workflow_id int NOT NULL,
+    workflow_version_id int,
     node_key varchar(160) NOT NULL,
     session_id int,
     node_message_role enum('user','assistant') NOT NULL,
@@ -246,6 +262,7 @@ const statements = [
     created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     KEY node_messages_workflow_key (workflow_id, node_key),
+    KEY node_messages_version_idx (workflow_version_id),
     CONSTRAINT ov_node_messages_workflow_fk FOREIGN KEY (workflow_id) REFERENCES ov_workflows (id),
     CONSTRAINT ov_node_messages_session_fk FOREIGN KEY (session_id) REFERENCES ov_sessions (id)
   )`,
@@ -253,6 +270,7 @@ const statements = [
     id int NOT NULL AUTO_INCREMENT,
     project_id int NOT NULL,
     workflow_run_id int,
+    workflow_version_id int,
     task_id int,
     session_id int,
     agent_id int,
@@ -260,6 +278,7 @@ const statements = [
     payload_json json,
     created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
+    KEY events_version_idx (workflow_version_id),
     CONSTRAINT ov_events_project_fk FOREIGN KEY (project_id) REFERENCES ov_projects (id),
     CONSTRAINT ov_events_run_fk FOREIGN KEY (workflow_run_id) REFERENCES ov_workflow_runs (id),
     CONSTRAINT ov_events_task_fk FOREIGN KEY (task_id) REFERENCES ov_tasks (id),
@@ -384,6 +403,85 @@ export async function ensureTables(): Promise<void> {
   for (const statement of statements) {
     await pool.query(statement);
   }
+}
+
+/** 能力目录从按项目改为按租户共享。 */
+export async function migrateCapabilitiesToTenant(): Promise<void> {
+  const [tables] = await pool.query(
+    `SELECT table_name AS tableName
+       FROM information_schema.tables
+      WHERE table_schema = DATABASE() AND table_name = 'ov_capabilities'`,
+  );
+  if ((tables as Array<{ tableName: string }>).length === 0) return;
+
+  const [columns] = await pool.query(
+    `SELECT column_name AS columnName
+       FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'ov_capabilities'`,
+  );
+  const names = new Set((columns as Array<{ columnName: string }>).map((row) => row.columnName));
+  if (names.has('tenant_id') && !names.has('project_id')) {
+    await pool.query(`
+      DELETE c0 FROM ov_capabilities c0
+      INNER JOIN ov_capabilities c1
+        ON c0.capability_key = c1.capability_key
+       AND c1.tenant_id = (SELECT id FROM ov_tenants ORDER BY id ASC LIMIT 1)
+       WHERE c0.tenant_id IS NULL OR c0.tenant_id = 0
+    `);
+    await pool.query(`
+      UPDATE ov_capabilities
+         SET tenant_id = (SELECT id FROM ov_tenants ORDER BY id ASC LIMIT 1)
+       WHERE tenant_id IS NULL OR tenant_id = 0
+    `);
+    return;
+  }
+  if (!names.has('project_id')) return;
+
+  if (!names.has('tenant_id')) {
+    await pool.query('ALTER TABLE ov_capabilities ADD COLUMN tenant_id int NULL');
+  }
+  await pool.query(`
+    UPDATE ov_capabilities c
+    INNER JOIN ov_projects p ON p.id = c.project_id
+       SET c.tenant_id = p.tenant_id
+     WHERE c.tenant_id IS NULL OR c.tenant_id = 0
+  `);
+  await pool.query(`
+    UPDATE ov_capabilities
+       SET tenant_id = (SELECT id FROM ov_tenants ORDER BY id ASC LIMIT 1)
+     WHERE tenant_id IS NULL OR tenant_id = 0
+  `);
+  await pool.query(`
+    DELETE c1 FROM ov_capabilities c1
+    INNER JOIN ov_capabilities c2
+      ON c1.tenant_id = c2.tenant_id
+     AND c1.capability_key = c2.capability_key
+     AND c1.id > c2.id
+  `);
+
+  const [fkRows] = await pool.query(
+    `SELECT constraint_name AS constraintName
+       FROM information_schema.referential_constraints
+      WHERE constraint_schema = DATABASE() AND table_name = 'ov_capabilities'`,
+  );
+  for (const row of fkRows as Array<{ constraintName: string }>) {
+    await pool.query(`ALTER TABLE ov_capabilities DROP FOREIGN KEY \`${row.constraintName}\``);
+  }
+  const [indexRows] = await pool.query(
+    `SELECT DISTINCT index_name AS indexName
+       FROM information_schema.statistics
+      WHERE table_schema = DATABASE()
+        AND table_name = 'ov_capabilities'
+        AND index_name <> 'PRIMARY'`,
+  );
+  for (const row of indexRows as Array<{ indexName: string }>) {
+    await pool.query(`ALTER TABLE ov_capabilities DROP INDEX \`${row.indexName}\``);
+  }
+
+  await pool.query('ALTER TABLE ov_capabilities DROP COLUMN project_id');
+  await pool.query('ALTER TABLE ov_capabilities MODIFY tenant_id int NOT NULL');
+  await pool.query('ALTER TABLE ov_capabilities ADD UNIQUE KEY capabilities_tenant_key_unique (tenant_id, capability_key)');
+  await pool.query('ALTER TABLE ov_capabilities ADD CONSTRAINT ov_capabilities_tenant_fk FOREIGN KEY (tenant_id) REFERENCES ov_tenants (id)');
 }
 
 export async function repairSchema(): Promise<string[]> {
