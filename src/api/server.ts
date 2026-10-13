@@ -20,6 +20,7 @@ import {
   plans,
   projects,
   sessions,
+  skills,
   tasks,
   tenantMembers,
   tenants,
@@ -39,12 +40,38 @@ import {
   membershipsForUser,
   registerUser,
 } from '../application/tenancy.js';
-import { resolveAgentModel, resolveWorkflowNode } from '../application/model-resolver.js';
-import { assertProjectCatalogKeys, collectCapabilityKeys, ensureTenantCapabilities, normalizeCapabilityKey, storedNodeCapabilityKeys, workflowNodeCapabilityKeys } from '../application/capabilities.js';
+import {
+  apiKeyFromProviderConfig,
+  parseModelId,
+  piLaunchCredentials,
+  publicProviderConfig,
+  resolveAgentModel,
+  resolveModelById,
+  resolveWorkflowNode,
+  withProviderApiKey,
+} from '../application/model-resolver.js';
+import { assertProjectCatalogKeys, collectCapabilityKeys, ensureTenantCapabilities, normalizeCapabilityKey, storedNodeCapabilityKeys, tenantIdOfProject, workflowNodeCapabilityKeys } from '../application/capabilities.js';
+import {
+  assertProjectSkillKeys,
+  collectSkillKeys,
+  ensureTenantSkills,
+  loadAgentSkills,
+  materializeSkillDirs,
+  normalizeSkillKey,
+  runtimePolicyFromSkills,
+  type SkillRow,
+} from '../application/skills.js';
+import {
+  installSkillMarkdown,
+  installSkillZipPackage,
+  parseSkillFrontmatter,
+  removeSkillStore,
+  syncSkillMarkdownFile,
+} from '../application/skill-packages.js';
 import { deleteAgentsByIds } from '../application/delete-agents.js';
-import { assertWorkingDirectoryAllowed } from '../application/runtime-policy.js';
+import { assertWorkingDirectoryAllowed, resolveRuntimePolicy } from '../application/runtime-policy.js';
 import { acceptanceLimit, acceptanceRuleLines, parseAcceptanceVerdict, type AcceptanceParty } from '../application/acceptance.js';
-import { assertAcyclicGraph, graphIsComplete, selectRunnableTasks } from '../application/task-graph.js';
+import { assertAcyclicGraph, effectiveWorkflowNodeId, graphIsComplete, plannedTaskStatus, reachableFromRoots, selectRunnableTasks } from '../application/task-graph.js';
 import { pickLatestTasksByKey, resumeFrontier } from '../application/resume-graph.js';
 import {
   buildMysqlUrl,
@@ -99,7 +126,7 @@ function sendJson(response: ServerResponse, status: number, payload: unknown) {
     'content-type': 'application/json; charset=utf-8',
     'access-control-allow-origin': config.webOrigin,
     'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
-    'access-control-allow-headers': 'content-type, authorization, x-orvia-tenant-id, x-orvia-filename',
+    'access-control-allow-headers': 'content-type, authorization, x-orvia-tenant-id, x-orvia-filename, x-orvia-skill-key, x-orvia-skill-name, x-orvia-skill-description, x-orvia-skill-tools',
   });
   response.end(JSON.stringify(payload));
 }
@@ -126,6 +153,7 @@ const activeWorkflowSessions = new Map<number, Set<number>>();
 const executingWorkflowRuns = new Set<number>();
 const queuedWorkflowRuns = new Set<number>();
 const activeNodeChats = new Set<string>();
+const interruptedNodeChatSessions = new Set<number>();
 const NODE_CHAT_LOCK_TTL_SECONDS = 180;
 
 function nodeChatLockName(chatKey: string) {
@@ -135,6 +163,22 @@ function nodeChatLockName(chatKey: string) {
 async function endNodeChat(chatKey: string): Promise<void> {
   activeNodeChats.delete(chatKey);
   await redisRuntime().releaseLock(nodeChatLockName(chatKey));
+}
+
+async function interruptNodeChat(workflowId: number, nodeKey: string): Promise<boolean> {
+  const open = await db.select().from(nodeMessages)
+    .where(and(
+      eq(nodeMessages.workflowId, workflowId),
+      eq(nodeMessages.nodeKey, nodeKey),
+      inArray(nodeMessages.status, ['pending', 'streaming']),
+    ))
+    .orderBy(desc(nodeMessages.id))
+    .limit(1);
+  const row = open[0];
+  if (!row?.sessionId) return false;
+  interruptedNodeChatSessions.add(row.sessionId);
+  await piRuntime.stop(row.sessionId);
+  return true;
 }
 
 async function healStuckNodeChat(workflowId: number, nodeKey: string): Promise<void> {
@@ -315,6 +359,20 @@ async function resolveEventVersionId(event: Pick<NewEvent, 'workflowVersionId' |
   return workflow?.currentVersionId ?? undefined;
 }
 
+async function publishEventEnvelope(envelope: Record<string, unknown>): Promise<void> {
+  try {
+    await redisRuntime().publish('orvia:events', JSON.stringify(envelope));
+  } catch (error) {
+    // 推送失败不应打断节点执行；面板可能短暂收不到实时事件，重连后会恢复
+    console.error(JSON.stringify({
+      level: 'error',
+      type: 'redis.publish_failed',
+      message: error instanceof Error ? error.message : String(error),
+      eventType: envelope.type,
+    }));
+  }
+}
+
 async function broadcastEphemeralEvent(event: NewEvent) {
   // 不查库、不落库；只经 Redis 推给面板。id 用大基数递增，避免和库内自增 id 冲突
   ephemeralEventSeq += 1;
@@ -330,7 +388,7 @@ async function broadcastEphemeralEvent(event: NewEvent) {
     payload: event.payloadJson ?? null,
     occurredAt: new Date().toISOString(),
   };
-  await redisRuntime().publish('orvia:events', JSON.stringify(envelope));
+  await publishEventEnvelope(envelope);
   return envelope;
 }
 
@@ -350,7 +408,7 @@ async function persistAndBroadcastEvent(event: NewEvent) {
     payload: row.payloadJson ?? null,
     occurredAt: new Date().toISOString(),
   };
-  await redisRuntime().publish('orvia:events', JSON.stringify(envelope));
+  await publishEventEnvelope(envelope);
   return envelope;
 }
 
@@ -432,6 +490,11 @@ async function ensureLegacyWorkflowVersion(workflowId: number): Promise<typeof w
   return row ?? null;
 }
 
+async function assertActiveModelIds(modelIds: Array<number | undefined>) {
+  const unique = [...new Set(modelIds.filter((id): id is number => typeof id === 'number'))];
+  for (const id of unique) await resolveModelById(id);
+}
+
 async function publishWorkflowVersion(workflowId: number, input: {
   name: string;
   definitionJson: unknown;
@@ -445,7 +508,10 @@ async function publishWorkflowVersion(workflowId: number, input: {
   }
   const prepared = prepareWorkflowDefinition(input.definitionJson, true);
   if (prepared.definitionNodes.length === 0) throw new OrviaError('请至少添加一个节点', 'validation', 400);
+  assertTaskNodesHaveModels(prepared.definitionNodes);
   await assertProjectCatalogKeys(workflow.projectId, prepared.nodeCapabilityLists.flat());
+  await assertProjectSkillKeys(workflow.projectId, prepared.nodeSkillLists.flat());
+  await assertActiveModelIds(prepared.nodeModelIds);
   const maxSeqRow = (await db.select({ seq: workflowVersions.seq }).from(workflowVersions)
     .where(eq(workflowVersions.workflowId, workflowId))
     .orderBy(desc(workflowVersions.seq))
@@ -491,7 +557,10 @@ async function activateWorkflowVersion(workflowId: number, versionId: number): P
     .limit(1))[0];
   if (!snapshot) throw new OrviaError('版本不存在', 'not_found', 404);
   const prepared = prepareWorkflowDefinition(snapshot.definitionJson, true);
+  assertTaskNodesHaveModels(prepared.definitionNodes);
   await assertProjectCatalogKeys(workflow.projectId, prepared.nodeCapabilityLists.flat());
+  await assertProjectSkillKeys(workflow.projectId, prepared.nodeSkillLists.flat());
+  await assertActiveModelIds(prepared.nodeModelIds);
   await db.transaction(async (tx) => {
     await tx.update(workflows).set({
       name: snapshot.name,
@@ -516,6 +585,17 @@ async function finishRunIfStillRunning(workflowRunId: number, workflowId: number
   const updated = await db.update(workflowRuns).set({ status, ...patch }).where(and(eq(workflowRuns.id, workflowRunId), eq(workflowRuns.status, 'running')));
   if (updated[0].affectedRows !== 1) return false;
   await rememberRunStatus(workflowRunId, status, workflowId);
+  if (status === 'failed') {
+    const projectId = (await db.select({ projectId: workflows.projectId }).from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0]?.projectId;
+    if (projectId) {
+      await persistAndBroadcastEvent({
+        projectId,
+        workflowRunId,
+        type: 'workflow.failed',
+        payloadJson: patch.errorJson && typeof patch.errorJson === 'object' ? patch.errorJson as Record<string, unknown> : { error: patch.errorJson },
+      });
+    }
+  }
   return true;
 }
 
@@ -526,12 +606,27 @@ function dependsOnNodeIds(inputJson: unknown): number[] {
 
 async function workflowRunMatchesGraph(workflowRunId: number, workflowId: number): Promise<boolean> {
   const nodes = await db.select({ id: workflowNodes.id }).from(workflowNodes).where(eq(workflowNodes.workflowId, workflowId));
-  const taskRows = await db.select({ workflowNodeId: tasks.workflowNodeId, status: tasks.status }).from(tasks).where(eq(tasks.workflowRunId, workflowRunId));
-  const live = taskRows.filter((task) => task.status !== 'cancelled');
-  if (live.length !== nodes.length) return false;
+  const taskRows = await db.select({
+    workflowNodeId: tasks.workflowNodeId,
+    status: tasks.status,
+    inputJson: tasks.inputJson,
+    planId: tasks.planId,
+  }).from(tasks).where(eq(tasks.workflowRunId, workflowRunId));
+  const activePlan = (await db.select({ id: plans.id }).from(plans)
+    .where(and(eq(plans.workflowRunId, workflowRunId), eq(plans.status, 'active')))
+    .orderBy(desc(plans.version))
+    .limit(1))[0];
+  const current = activePlan
+    ? taskRows.filter((task) => task.planId === activePlan.id)
+    : taskRows;
+  // 未连到开始节点的 cancelled 仍占位，不能当成「图已改过」去整图重建
+  const occupying = current.filter((task) => (
+    task.status !== 'cancelled' || Boolean(jsonObject(task.inputJson).skippedUnreachable)
+  ));
+  if (occupying.length !== nodes.length) return false;
   const nodeIds = new Set(nodes.map((node) => node.id));
   const seen = new Set<number>();
-  for (const task of live) {
+  for (const task of occupying) {
     if (!task.workflowNodeId || !nodeIds.has(task.workflowNodeId) || seen.has(task.workflowNodeId)) return false;
     seen.add(task.workflowNodeId);
   }
@@ -567,8 +662,15 @@ async function rebuildWorkflowRunGraph(workflowRunId: number, workflowId: number
         outputJson: { error: 'Run restarted from the beginning' },
       }).where(and(inArray(sessions.taskId, previousTaskIds), inArray(sessions.status, ['pending', 'running', 'paused'])));
     }
-    await tx.update(checkpoints).set({ status: 'superseded', resolvedAt: new Date() }).where(and(eq(checkpoints.workflowRunId, workflowRunId), eq(checkpoints.status, 'pending')));
-    await tx.update(decisions).set({ status: 'superseded', resolvedAt: new Date() }).where(and(eq(decisions.workflowRunId, workflowRunId), eq(decisions.status, 'pending')));
+    // 从头开始：清掉所有未结束的复核/决策（含已批准、已退回），避免人工节点仍显示旧状态
+    await tx.update(checkpoints).set({ status: 'superseded', resolvedAt: new Date() }).where(and(
+      eq(checkpoints.workflowRunId, workflowRunId),
+      inArray(checkpoints.status, ['pending', 'approved', 'changes_requested', 'rejected', 'overridden']),
+    ));
+    await tx.update(decisions).set({ status: 'superseded', resolvedAt: new Date() }).where(and(
+      eq(decisions.workflowRunId, workflowRunId),
+      inArray(decisions.status, ['pending', 'approved', 'changes_requested', 'rejected', 'overridden']),
+    ));
     const currentInput = jsonObject((await tx.select({ inputJson: workflowRuns.inputJson }).from(workflowRuns).where(eq(workflowRuns.id, workflowRunId)))[0]?.inputJson);
     const keptInput = { ...currentInput };
     delete keptInput.executionId;
@@ -581,11 +683,20 @@ async function rebuildWorkflowRunGraph(workflowRunId: number, workflowId: number
     });
     const planId = planResult[0].insertId;
     const planned = [];
+    const startIds = nodes.filter((node) => node.nodeType === 'start').map((node) => node.id);
+    const reachable = startIds.length > 0
+      ? reachableFromRoots(
+        nodes.map((node) => node.id),
+        edges.map((edge) => ({ source: edge.sourceNodeId, target: edge.targetNodeId })),
+        startIds,
+      )
+      : null;
     for (const node of nodes) {
       const depends = edges.filter((edge) => edge.targetNodeId === node.id).map((edge) => edge.sourceNodeId);
       const capabilities = storedNodeCapabilityKeys(node);
-      if (capabilities.length === 0 && node.nodeType !== 'start' && node.nodeType !== 'end') throw new OrviaError(`请为 Agent「${node.name}」选择能力`, 'validation', 400);
+      if (capabilities.length === 0 && node.nodeType === 'task') throw new OrviaError(`请为 Agent「${node.name}」选择能力`, 'validation', 400);
       const nodeConfig = withoutLegacySkill(jsonObject(node.configJson));
+      const status = plannedTaskStatus(node.id, depends, reachable);
       const inputJson: Record<string, unknown> = {
         ...nodeConfig,
         capabilities,
@@ -593,6 +704,7 @@ async function rebuildWorkflowRunGraph(workflowRunId: number, workflowId: number
         workflowNodeId: node.id,
         nodeType: node.nodeType,
         dependsOnNodeIds: depends,
+        ...(status === 'cancelled' ? { skippedUnreachable: true } : {}),
       };
       delete inputJson.skill;
       delete inputJson.acceptanceResult;
@@ -607,13 +719,20 @@ async function rebuildWorkflowRunGraph(workflowRunId: number, workflowId: number
         planId,
         workflowNodeId: node.id,
         name: node.name,
-        status: depends.length > 0 ? 'blocked' : 'pending',
+        status,
         maxRetries: typeof nodeConfig.maxRetries === 'number' ? nodeConfig.maxRetries : 0,
         inputJson,
+        ...(status === 'cancelled' ? { outputJson: { skipped: true, error: '未连接到开始节点，已跳过' } } : {}),
       });
       const taskId = taskResult[0].insertId;
-      const sessionResult = await tx.insert(sessions).values({ taskId, runtime: 'pi', status: 'pending', inputJson });
-      planned.push({ nodeId: node.id, taskId, sessionId: sessionResult[0].insertId, capabilities, nodeType: node.nodeType, dependsOnNodeIds: depends });
+      const sessionResult = await tx.insert(sessions).values({
+        taskId,
+        runtime: 'pi',
+        status: status === 'cancelled' ? 'failed' : 'pending',
+        inputJson,
+        ...(status === 'cancelled' ? { outputJson: { error: '未连接到开始节点，已跳过' }, completedAt: new Date() } : {}),
+      });
+      planned.push({ nodeId: node.id, taskId, sessionId: sessionResult[0].insertId, capabilities, nodeType: node.nodeType, dependsOnNodeIds: depends, status });
     }
     await tx.update(workflowRuns).set({
       currentPlanVersion: version,
@@ -702,10 +821,29 @@ async function resumeInterruptedTasks(workflowRunId: number, workflowId: number)
   const names = await assertResumePossible(workflowRunId, workflowId);
   const matches = await resumeMatches(workflowRunId, workflowId);
   const byNode = new Map(matches.map((item) => [item.node.id, item]));
+  const startIds = matches.filter((item) => item.node.nodeType === 'start').map((item) => item.node.id);
+  const reachable = startIds.length > 0
+    ? reachableFromRoots(
+      matches.map((item) => item.node.id),
+      matches.flatMap((item) => item.depends.map((source) => ({ source, target: item.node.id }))),
+      startIds,
+    )
+    : null;
   for (const item of matches) {
     // Keep finished nodes as-is so「从当前节点继续」不会丢掉已完成产物
     if (item.task.status === 'completed') {
       await db.update(tasks).set({ workflowNodeId: item.node.id }).where(eq(tasks.id, item.task.id));
+      continue;
+    }
+    if (reachable && !reachable.has(item.node.id)) {
+      await db.update(tasks).set({
+        workflowNodeId: item.node.id,
+        name: item.node.name,
+        status: 'cancelled',
+        errorKind: null,
+        outputJson: { skipped: true, error: '未连接到开始节点，已跳过' },
+        inputJson: { ...jsonObject(item.task.inputJson), skippedUnreachable: true, dependsOnNodeIds: item.depends },
+      }).where(eq(tasks.id, item.task.id));
       continue;
     }
     const ready = item.depends.every((nodeId) => byNode.get(nodeId)?.task.status === 'completed');
@@ -721,6 +859,7 @@ async function resumeInterruptedTasks(workflowRunId: number, workflowId: number)
       dependsOnNodeIds: item.depends,
     };
     delete inputJson.skill;
+    delete inputJson.skippedUnreachable;
     // Resume re-runs incomplete nodes; drop stale wait markers but keep redo context if any
     delete inputJson.acceptanceWaived;
     if (item.task.status === 'awaiting_decision' || item.task.status === 'cancelled' || item.task.status === 'failed') {
@@ -958,27 +1097,65 @@ async function replyToNode(workflowId: number, nodeKey: string, content: string,
   if (!workflow || !node) throw new Error('节点不存在');
   const history = await nodeGuidanceText(workflowId, nodeKey);
   const directory = await latestNodeDirectory(workflowId, nodeKey);
+  const executionContext = await currentNodeExecutionContext(workflowId, nodeKey);
   const config = jsonObject(node.configJson);
   const instruction = typeof config.instruction === 'string' ? config.instruction : '';
   const outputRequirement = typeof config.outputRequirement === 'string' ? config.outputRequirement : '';
   const run = (await db.select({ id: workflowRuns.id }).from(workflowRuns).where(eq(workflowRuns.workflowId, workflowId)).limit(1))[0];
-  const resolved = await resolveWorkflowNode({
+  const capabilityKeys = storedNodeCapabilityKeys(node);
+  const tenantId = await tenantIdOfProject(workflow.projectId);
+  const modelId = parseModelId(config.modelId);
+  if (!modelId) throw new OrviaError(`请先为 Agent「${node.name}」选择模型`, 'validation', 400);
+  const launch = piLaunchCredentials(await resolveModelById(modelId));
+  let systemPrompt = (await resolveWorkflowNode({
     projectId: workflow.projectId,
     workflowRunId: run?.id,
     name: node.name,
-    capabilities: storedNodeCapabilityKeys(node),
-  });
-  const prompt = [
-    `你是多 Agent 协作中的 Agent「${node.name}」。用户正在直接指导你，这些指导在之后和下游 Agent 协作时继续生效。`,
-    instruction.trim() ? `任务说明：\n${instruction.trim()}` : '',
-    outputRequirement.trim() ? `产出要求：\n${outputRequirement.trim()}` : '',
-    directory
-      ? '当前目录就是这个 Agent 的工作目录。按用户的指导调整这里的做法和产出，需要时直接修改目录里的文件。'
-      : '这个 Agent 还没有自己的工作目录。只回复你理解的指导，以及执行时会怎么做。不要创建或修改文件。',
-    history.trim() ? `对话：\n${history.trim()}\n\n请回复最后一条用户指导。` : `用户刚才说：\n${content}`,
-  ].filter(Boolean).join('\n\n');
+    capabilities: capabilityKeys,
+  })).systemPrompt;
+  const piProvider = launch.provider;
+  const piModel = launch.model;
+  const piApiKey = launch.apiKey;
+  let fallbackPolicy = resolveRuntimePolicy([]);
+  try {
+    const matched = await resolveAgentModel({
+      projectId: workflow.projectId,
+      workflowRunId: run?.id,
+      capabilities: capabilityKeys,
+    });
+    systemPrompt = matched.systemPrompt || systemPrompt;
+    fallbackPolicy = matched.runtimePolicy;
+  } catch {
+    // 对话仍以节点配置的模型为准；Agent 匹配只用于补充 systemPrompt / 默认策略
+  }
+  const skillKeys = collectSkillKeys(config.skills);
+  const skillRows = skillKeys.length ? await loadAgentSkills(skillKeys, tenantId) : [];
+  const skillPolicy = skillRows.length > 0 ? runtimePolicyFromSkills(skillRows) : fallbackPolicy;
   const root = await managedWorkflowRoot(workflowId);
   const workingDirectory = directory ?? root;
+  const skillPaths = await materializeSkillDirs(skillRows, workingDirectory);
+  const canUseTools = Boolean(directory) || skillRows.length > 0;
+  const allowedTools = skillRows.length > 0
+    ? skillPolicy.allowedTools
+    : (directory ? fallbackPolicy.allowedTools : []);
+  const prompt = [
+    `你是多 Agent 协作中的 Agent「${node.name}」。用户正在直接和你对话。`,
+    executionContext.trim()
+      ? executionContext.trim()
+      : '当前还没有这个节点的执行记录。请根据节点配置理解任务，并回复用户。',
+    instruction.trim() ? `节点配置 · 任务说明：\n${instruction.trim()}` : '',
+    outputRequirement.trim() ? `节点配置 · 产出要求：\n${outputRequirement.trim()}` : '',
+    skillRows.length
+      ? `你已启用 Skill：${skillRows.map((item) => item.name).join('、')}。需要联网搜索或抓取 URL 时，请使用 bash 执行 curl，并遵循已加载的 Skill 说明；不要声称自己无法访问网络。`
+      : '',
+    directory
+      ? '当前目录就是这个 Agent 的工作目录。可以查看或按指导调整这里的文件；正在跑的那次执行不会因本次对话而中断。'
+      : skillRows.length
+        ? '这个 Agent 还没有自己的工作目录。你可以使用已启用的工具完成联网等操作并回复；不要创建无关文件。'
+        : '这个 Agent 还没有自己的工作目录。只回复你理解的内容，以及执行时会怎么做。不要创建或修改文件。',
+    '用户的新指导会留下来，留给之后的执行继续生效。',
+    history.trim() ? `对话：\n${history.trim()}\n\n请回复最后一条用户消息。` : `用户刚才说：\n${content}`,
+  ].filter(Boolean).join('\n\n');
   const output: string[] = [];
   const thinking: string[] = [];
   let activity = '';
@@ -1004,14 +1181,34 @@ async function replyToNode(workflowId: number, nodeKey: string, content: string,
     if (!flushTimer) flushTimer = setTimeout(flush, 80);
   };
   await db.update(sessions).set({ status: 'running', startedAt: new Date() }).where(eq(sessions.id, sessionId));
+  if (interruptedNodeChatSessions.has(sessionId)) {
+    closed = true;
+    interruptedNodeChatSessions.delete(sessionId);
+    await db.update(nodeMessages).set({
+      content: '已打断',
+      thinking: null,
+      status: 'failed',
+    }).where(eq(nodeMessages.id, assistantMessageId));
+    await db.update(sessions).set({
+      status: 'failed',
+      outputJson: { interrupted: true },
+      completedAt: new Date(),
+    }).where(eq(sessions.id, sessionId));
+    return;
+  }
   await piRuntime.start({
     sessionId,
     taskId: 0,
     prompt,
-    systemPrompt: resolved.systemPrompt,
+    systemPrompt,
+    provider: piProvider,
+    model: piModel,
+    apiKey: piApiKey,
     workingDirectory,
-    allowedTools: directory ? resolved.runtimePolicy.allowedTools : [],
-    deniedTools: directory ? resolved.runtimePolicy.deniedTools : undefined,
+    allowedTools: canUseTools ? allowedTools : [],
+    deniedTools: skillRows.length > 0 ? skillPolicy.deniedTools : (directory ? fallbackPolicy.deniedTools : undefined),
+    skillPaths,
+    disableDefaultSkills: true,
     onEvent: (runtimeEvent) => {
       if (runtimeEvent.type === 'thinking' && typeof runtimeEvent.payload === 'string') thinking.push(runtimeEvent.payload);
       if (runtimeEvent.type === 'stdout' && typeof runtimeEvent.payload === 'string') output.push(runtimeEvent.payload);
@@ -1019,21 +1216,28 @@ async function replyToNode(workflowId: number, nodeKey: string, content: string,
       scheduleFlush();
     },
   });
+  if (interruptedNodeChatSessions.has(sessionId)) await piRuntime.stop(sessionId);
   const completed = await piRuntime.wait(sessionId);
   closed = true;
   if (flushTimer) clearTimeout(flushTimer);
   await writes;
-  const text = output.join('').trim() || completed.message || '';
+  const interrupted = interruptedNodeChatSessions.delete(sessionId);
+  const streamed = output.join('').trim();
+  const text = interrupted
+    ? streamed
+    : (streamed || completed.message || '');
   const thought = thinking.join('').trim();
-  const failed = completed.status !== 'completed';
+  const failed = interrupted || completed.status !== 'completed';
   await db.update(nodeMessages).set({
-    content: text || (failed ? 'Agent 没有回复' : activity ? '已按你的指导处理了这个 Agent 的文件。' : '已收到'),
+    content: interrupted
+      ? (text ? `${text}\n\n（已打断）` : '已打断')
+      : (text || (failed ? 'Agent 没有回复' : activity ? '已按你的指导处理了这个 Agent 的文件。' : '已收到')),
     thinking: thought || null,
     status: failed ? 'failed' : 'completed',
   }).where(eq(nodeMessages.id, assistantMessageId));
   await db.update(sessions).set({
     status: failed ? 'failed' : 'completed',
-    outputJson: { text },
+    outputJson: interrupted ? { text, interrupted: true } : { text },
     completedAt: new Date(),
   }).where(eq(sessions.id, sessionId));
 }
@@ -1071,6 +1275,55 @@ const NODE_STATUS_LABEL: Record<string, string> = {
   awaiting_decision: '等待确认', completed: '已完成', failed: '失败', cancelled: '已停止',
 };
 
+/** 对话轻关联：注入该节点最近/正在执行的任务上下文（不接入执行中的 Pi 进程） */
+async function currentNodeExecutionContext(workflowId: number, nodeKey: string): Promise<string> {
+  const run = (await db.select({ id: workflowRuns.id, status: workflowRuns.status }).from(workflowRuns)
+    .where(eq(workflowRuns.workflowId, workflowId))
+    .orderBy(desc(workflowRuns.id))
+    .limit(1))[0];
+  if (!run) return '';
+  const taskRows = await db.select().from(tasks).where(eq(tasks.workflowRunId, run.id)).orderBy(desc(tasks.id));
+  const task = taskRows.find((item) => {
+    const input = jsonObject(item.inputJson);
+    return input.key === nodeKey && item.status !== 'cancelled';
+  });
+  if (!task) return '';
+  const input = jsonObject(task.inputJson);
+  const output = jsonObject(task.outputJson);
+  const directory = typeof output.workspacePath === 'string' && output.workspacePath
+    ? output.workspacePath
+    : typeof input.workspacePath === 'string' ? input.workspacePath : '';
+  const live = task.status === 'running' || task.status === 'pending' || task.status === 'paused' || task.status === 'awaiting_decision';
+  const lines = [
+    live
+      ? `你当前有一次「${NODE_STATUS_LABEL[task.status] ?? task.status}」的执行。对话和这次执行是分开的会话：你不能中途改写正在跑的那次执行，但必须基于下面的任务上下文回答用户，并给出可留给后续执行的指导。`
+      : `下面是这个 Agent 最近一次执行的上下文。请据此回答；用户的新指导会留给之后的执行。`,
+    `执行状态：${NODE_STATUS_LABEL[task.status] ?? task.status}`,
+    typeof input.instruction === 'string' && input.instruction.trim() ? `任务说明：\n${input.instruction.trim()}` : '',
+    typeof input.outputRequirement === 'string' && input.outputRequirement.trim() ? `产出要求：\n${input.outputRequirement.trim()}` : '',
+    typeof input.redoReason === 'string' && input.redoReason.trim() ? `退回原因：\n${input.redoReason.trim()}` : '',
+    typeof input.prompt === 'string' && input.prompt.trim()
+      ? `执行提示（摘录）：\n${input.prompt.trim().slice(0, 2500)}`
+      : '',
+  ];
+  if (directory && isManagedWorkspace(directory) && await directoryExists(directory)) {
+    lines.push(`工作目录：${directory}`);
+    try {
+      const brief = (await readFile(path.join(directory, '任务.md'), 'utf8')).trim();
+      if (brief) lines.push(`任务书（摘录）：\n${brief.slice(0, 2500)}`);
+    } catch {
+      /* 任务书可能尚未写出 */
+    }
+    try {
+      const deliverable = (await readDeliverableText(directory, 4000)).trim();
+      if (deliverable) lines.push(`目录里已有产出（摘录）：\n${deliverable.slice(0, 2500)}`);
+    } catch {
+      /* ignore */
+    }
+  }
+  return lines.filter(Boolean).join('\n\n');
+}
+
 async function workflowRunSummary(workflowRunId: number) {
   const run = (await db.select({ workflowId: workflowRuns.workflowId }).from(workflowRuns).where(eq(workflowRuns.id, workflowRunId)))[0];
   const graphNodes = run ? await db.select().from(workflowNodes).where(eq(workflowNodes.workflowId, run.workflowId)) : [];
@@ -1095,10 +1348,12 @@ async function workflowRunSummary(workflowRunId: number) {
     const key = recordKey(input) || `task-${task.id}`;
     const directory = directories.get(key) ?? '';
     const names = directory && isManagedWorkspace(directory) ? await listDeliverableNames(directory) : [];
+    const error = task.status === 'failed' ? failureReason(task.outputJson, '') : '';
     nodes.push({
       key,
       name: task.name,
       status: task.status,
+      ...(error ? { error } : {}),
       files: names.map((name) => ({ name, path: path.join(directory, name) })),
     });
   }
@@ -1107,10 +1362,11 @@ async function workflowRunSummary(workflowRunId: number) {
   return nodes;
 }
 
-function summaryText(nodes: Array<{ name: string; status: string; files: Array<{ name: string }> }>): string {
+function summaryText(nodes: Array<{ name: string; status: string; error?: string; files: Array<{ name: string }> }>): string {
   const lines = ['# 流程进度', ''];
   for (const node of nodes) {
     lines.push(`- ${node.name}：${NODE_STATUS_LABEL[node.status] ?? node.status}`);
+    if (node.error) lines.push(`  - 失败原因：${node.error}`);
     if (node.files.length === 0) lines.push('  - （没有产物文件）');
     for (const file of node.files) lines.push(`  - ${file.name}`);
   }
@@ -1287,6 +1543,251 @@ async function saveAcceptanceResult(
   await db.update(tasks).set({ inputJson: input }).where(eq(tasks.id, task.id));
 }
 
+/** 把每次复核说明按上游节点追加进 inputJson，便于历史按节点查看 */
+function withCheckpointNodeReviewHistory(
+  inputJson: unknown,
+  decisionId: number,
+  entries: Array<{ key: string; name: string; note: string; action: string }>,
+): Record<string, unknown> {
+  const input = jsonObject(inputJson);
+  if (entries.length === 0) return input;
+  const historyByNode = { ...jsonObject(input.reviewHistoryByNode) };
+  const at = new Date().toISOString();
+  for (const entry of entries) {
+    if (!entry.key.trim()) continue;
+    const previous = Array.isArray(historyByNode[entry.key]) ? [...(historyByNode[entry.key] as unknown[])] : [];
+    previous.push({
+      key: entry.key,
+      name: entry.name,
+      note: entry.note,
+      action: entry.action,
+      decisionId,
+      at,
+    });
+    historyByNode[entry.key] = previous;
+  }
+  return { ...input, reviewHistoryByNode: historyByNode };
+}
+
+/** 人工复核退回：按上游节点分别带说明重做；未点名的上游保持完成 */
+async function returnCheckpointToUpstream(
+  projectId: number,
+  workflowId: number,
+  workflowRunId: number,
+  checkpointId: number,
+  reason: string,
+  targetReviews?: Array<{ key: string; reason: string }>,
+  decisionId?: number,
+): Promise<void> {
+  const checkpoint = (await db.select().from(checkpoints).where(eq(checkpoints.id, checkpointId)))[0];
+  const checker = checkpoint?.taskId
+    ? (await db.select().from(tasks).where(eq(tasks.id, checkpoint.taskId)))[0]
+    : undefined;
+  if (!checker) throw new OrviaError('找不到对应的人工复核任务', 'validation', 400);
+  const activePlan = (await db.select({ id: plans.id }).from(plans)
+    .where(and(eq(plans.workflowRunId, workflowRunId), eq(plans.status, 'active')))
+    .orderBy(desc(plans.version))
+    .limit(1))[0];
+  const runTasks = activePlan
+    ? await db.select().from(tasks).where(and(eq(tasks.workflowRunId, workflowRunId), eq(tasks.planId, activePlan.id)))
+    : await db.select().from(tasks).where(eq(tasks.workflowRunId, workflowRunId));
+  const live = runTasks.filter((task) => task.status !== 'cancelled');
+  const byNode = new Map<number, typeof tasks.$inferSelect>();
+  const byKey = new Map<string, typeof tasks.$inferSelect>();
+  for (const task of live) {
+    const nodeId = effectiveWorkflowNodeId(task);
+    if (nodeId != null) byNode.set(nodeId, task);
+    const key = recordKey(task.inputJson);
+    if (key) byKey.set(key, task);
+  }
+  const nodes = await db.select().from(workflowNodes).where(eq(workflowNodes.workflowId, workflowId));
+  const edges = await db.select().from(workflowEdges).where(eq(workflowEdges.workflowId, workflowId));
+  const checkerNodeKey = recordKey(checker.inputJson);
+  const checkerNodeId = effectiveWorkflowNodeId(checker);
+  const checkerNode = (checkerNodeKey ? nodes.find((entry) => recordKey(entry.configJson) === checkerNodeKey) : undefined)
+    ?? (checkerNodeId != null ? nodes.find((entry) => entry.id === checkerNodeId) : undefined);
+  // 优先当前画布入边（节点 id 会在重存后变化）；再叠任务里快照的 depends
+  const edgeParents = checkerNode
+    ? edges.filter((edge) => edge.targetNodeId === checkerNode.id).map((edge) => edge.sourceNodeId)
+    : [];
+  const seed = [...new Set([...dependsOnNodeIds(checker.inputJson), ...edgeParents])];
+  const queue = [...seed];
+  const seen = new Set<number>();
+  const providers: typeof tasks.$inferSelect[] = [];
+  const pushProvider = (task: typeof tasks.$inferSelect | undefined) => {
+    if (!task || providers.some((item) => item.id === task.id)) return;
+    providers.push(task);
+  };
+  while (queue.length > 0) {
+    const nodeId = queue.shift()!;
+    if (seen.has(nodeId)) continue;
+    seen.add(nodeId);
+    const node = nodes.find((entry) => entry.id === nodeId);
+    const key = node ? recordKey(node.configJson) : '';
+    const task = byNode.get(nodeId) ?? (key ? byKey.get(key) : undefined);
+    const nodeType = String(
+      (task ? jsonObject(task.inputJson).nodeType : undefined)
+      ?? node?.nodeType
+      ?? 'task',
+    );
+    if (nodeType === 'task') {
+      pushProvider(task);
+      if (!task && key) pushProvider(byKey.get(key));
+      continue;
+    }
+    // 上游若是开始/复核，再往前找真正的 Agent
+    const parents = [
+      ...(task ? dependsOnNodeIds(task.inputJson) : []),
+      ...edges.filter((edge) => edge.targetNodeId === nodeId).map((edge) => edge.sourceNodeId),
+    ];
+    for (const parent of parents) queue.push(parent);
+  }
+  // 仍找不到时：按 checker 依赖的旧 node id，直接在 live 任务里对 inputJson.workflowNodeId
+  if (providers.length === 0) {
+    for (const depId of dependsOnNodeIds(checker.inputJson)) {
+      const task = byNode.get(depId);
+      if (!task) continue;
+      const nodeType = String(jsonObject(task.inputJson).nodeType ?? 'task');
+      if (nodeType === 'task') pushProvider(task);
+    }
+  }
+  if (providers.length === 0) throw new OrviaError('没有可退回的上游 Agent', 'validation', 400);
+  const reviewByKey = new Map(
+    (targetReviews ?? [])
+      .filter((item) => item.key.trim() && item.reason.trim())
+      .map((item) => [item.key.trim(), item.reason.trim()] as const),
+  );
+  // 点名退回的目标若是人工节点，直接拒绝（不能退回到人工复核）
+  if (reviewByKey.size > 0) {
+    const humanTargets: string[] = [];
+    for (const key of reviewByKey.keys()) {
+      const node = nodes.find((entry) => recordKey(entry.configJson) === key);
+      const task = byKey.get(key);
+      const nodeType = String(
+        (task ? jsonObject(task.inputJson).nodeType : undefined)
+        ?? node?.nodeType
+        ?? '',
+      );
+      if (nodeType === 'checkpoint') humanTargets.push(task?.name || node?.name || key);
+    }
+    if (humanTargets.length > 0) {
+      throw new OrviaError(`不能退回到人工节点「${humanTargets.join('、')}」，请退回上游 Agent`, 'validation', 400);
+    }
+  }
+  const selected = reviewByKey.size > 0
+    ? providers.filter((provider) => reviewByKey.has(recordKey(provider.inputJson) || `task-${provider.id}`))
+    : providers;
+  if (selected.length === 0) {
+    throw new OrviaError(
+      reviewByKey.size > 0
+        ? '不能退回到人工节点，请选择上游 Agent 并写明原因'
+        : '请选择要退回的上游 Agent，并写明原因',
+      'validation',
+      400,
+    );
+  }
+
+  const run = await runInput(workflowRunId);
+  const counts = acceptanceCounts(run);
+  const checkerCountKey = checkerNodeKey || `task-${checker.id}`;
+  const checkerCounts = { ...(counts[checkerCountKey] ?? {}) };
+  const names: string[] = [];
+  const providerNodeIds: number[] = [];
+  const returnDetails: Array<{ key: string; name: string; reason: string }> = [];
+  for (const provider of selected) {
+    const providerInput = jsonObject(provider.inputJson);
+    const key = recordKey(providerInput) || `task-${provider.id}`;
+    const providerReason = reviewByKey.get(key) || reason;
+    const redos = (checkerCounts[key] ?? 0) + 1;
+    checkerCounts[key] = redos;
+    const providerNodeId = effectiveWorkflowNodeId(provider);
+    if (providerNodeId != null) providerNodeIds.push(providerNodeId);
+    const node = (providerNodeId != null ? nodes.find((entry) => entry.id === providerNodeId) : undefined)
+      ?? (key ? nodes.find((entry) => recordKey(entry.configJson) === key) : undefined);
+    const nextInput: Record<string, unknown> = {
+      ...providerInput,
+      ...(node ? withoutLegacySkill(jsonObject(node.configJson)) : {}),
+      dependsOnNodeIds: providerInput.dependsOnNodeIds,
+      workflowNodeId: providerNodeId ?? providerInput.workflowNodeId,
+      nodeType: providerInput.nodeType ?? node?.nodeType ?? 'task',
+      redoReason: providerReason,
+      redoRound: redos + 1,
+    };
+    delete nextInput.workspacePath;
+    delete nextInput.prompt;
+    delete nextInput.acceptanceWaived;
+    delete nextInput.acceptanceResult;
+    // completed → pending：退回重做（不走状态机校验，直接改库）
+    await db.update(tasks).set({ status: 'pending', outputJson: null, errorKind: null, inputJson: nextInput }).where(eq(tasks.id, provider.id));
+    const latest = (await db.select().from(sessions).where(eq(sessions.taskId, provider.id)).orderBy(desc(sessions.id)).limit(1))[0];
+    if (latest) {
+      await db.update(sessions).set({
+        status: 'pending',
+        inputJson: nextInput,
+        outputJson: null,
+        completedAt: null,
+        startedAt: null,
+      }).where(eq(sessions.id, latest.id));
+    } else {
+      await db.insert(sessions).values({ taskId: provider.id, runtime: 'pi', status: 'pending', inputJson: nextInput });
+    }
+    names.push(provider.name);
+    returnDetails.push({ key, name: provider.name, reason: providerReason });
+  }
+  counts[checkerCountKey] = checkerCounts;
+  const checkerInput: Record<string, unknown> = withCheckpointNodeReviewHistory(
+    {
+      ...jsonObject(checker.inputJson),
+      // 只等待本次退回的上游；其余已批准的上游保持 completed
+      dependsOnNodeIds: providerNodeIds.length ? providerNodeIds : dependsOnNodeIds(checker.inputJson),
+    },
+    decisionId ?? 0,
+    decisionId
+      ? returnDetails.map((item) => ({
+        key: item.key,
+        name: item.name,
+        note: item.reason,
+        action: 'return',
+      }))
+      : [],
+  );
+  delete checkerInput.workspacePath;
+  delete checkerInput.prompt;
+  // 人工节点回到「等待上游」
+  await db.update(tasks).set({
+    status: 'blocked',
+    outputJson: null,
+    errorKind: null,
+    inputJson: checkerInput,
+  }).where(eq(tasks.id, checker.id));
+  await db.update(sessions).set({
+    status: 'pending',
+    outputJson: null,
+    completedAt: null,
+    startedAt: null,
+    inputJson: checkerInput,
+  }).where(eq(sessions.taskId, checker.id));
+  await db.update(workflowRuns).set({
+    inputJson: { ...run, acceptanceRedos: counts },
+    status: 'paused',
+    completedAt: null,
+    errorJson: null,
+  }).where(eq(workflowRuns.id, workflowRunId));
+  await rememberRunStatus(workflowRunId, 'paused', workflowId);
+  await persistAndBroadcastEvent({
+    projectId,
+    workflowRunId,
+    taskId: checker.id,
+    type: 'checkpoint.returned',
+    payloadJson: {
+      message: `人工复核退回给${names.join('、')}`,
+      reason,
+      targets: names,
+      reviews: returnDetails,
+    },
+  });
+}
+
 async function sendAcceptanceBack(
   projectId: number,
   workflowId: number,
@@ -1390,6 +1891,46 @@ async function waiveAcceptance(checkerTaskId: number, note = ''): Promise<void> 
   await db.update(tasks).set({ status: 'pending', inputJson: input }).where(eq(tasks.id, task.id));
 }
 
+/** 验收时穿过开始/人工节点，只检查真正有产物的上游 Agent */
+function acceptanceProviderTasks(
+  runTasks: Array<typeof tasks.$inferSelect>,
+  dependNodeIds: number[],
+): Array<{ task: typeof tasks.$inferSelect; party: AcceptanceParty }> {
+  const live = runTasks.filter((item) => item.status !== 'cancelled');
+  const byNode = new Map<number, typeof tasks.$inferSelect>();
+  for (const item of live) {
+    const nodeId = effectiveWorkflowNodeId(item);
+    if (nodeId != null) byNode.set(nodeId, item);
+  }
+  const queue = [...dependNodeIds];
+  const seen = new Set<number>();
+  const providers: Array<{ task: typeof tasks.$inferSelect; party: AcceptanceParty }> = [];
+  while (queue.length > 0) {
+    const nodeId = queue.shift()!;
+    if (seen.has(nodeId)) continue;
+    seen.add(nodeId);
+    const item = byNode.get(nodeId);
+    if (!item || item.status !== 'completed') continue;
+    const providerInput = jsonObject(item.inputJson);
+    const nodeType = typeof providerInput.nodeType === 'string' ? providerInput.nodeType : 'task';
+    if (nodeType === 'end') continue;
+    if (nodeType === 'task') {
+      providers.push({
+        task: item,
+        party: {
+          key: recordKey(providerInput) || `task-${item.id}`,
+          name: item.name,
+          nodeType,
+        },
+      });
+      continue;
+    }
+    // 开始 / 人工复核：继续找它们上游的 Agent 产物，不要把人工节点本身拿去验收
+    for (const parent of dependsOnNodeIds(providerInput)) queue.push(parent);
+  }
+  return providers;
+}
+
 async function reviewAcceptance(projectId: number, workflowId: number, workflowRunId: number, task: typeof tasks.$inferSelect) {
   const input = jsonObject(task.inputJson);
   const rules = acceptanceRuleLines(input.acceptanceRules ?? input.acceptanceRule);
@@ -1397,13 +1938,7 @@ async function reviewAcceptance(projectId: number, workflowId: number, workflowR
   const rule = rules.map((item, index) => `${index + 1}. ${item}`).join('\n');
   const runTasks = await db.select().from(tasks).where(eq(tasks.workflowRunId, workflowRunId));
   const depends = dependsOnNodeIds(input);
-  const providers = runTasks.flatMap((item) => {
-    if (!item.workflowNodeId || !depends.includes(item.workflowNodeId) || item.status !== 'completed') return [];
-    const providerInput = jsonObject(item.inputJson);
-    const nodeType = typeof providerInput.nodeType === 'string' ? providerInput.nodeType : 'task';
-    if (nodeType === 'end') return [];
-    return [{ task: item, party: { key: recordKey(providerInput) || `task-${item.id}`, name: item.name, nodeType } satisfies AcceptanceParty }];
-  });
+  const providers = acceptanceProviderTasks(runTasks, depends);
   if (providers.length === 0) return null;
   await db.update(tasks).set({ status: 'running' }).where(eq(tasks.id, task.id));
   await persistAndBroadcastEvent({
@@ -1448,7 +1983,15 @@ async function reviewAcceptance(projectId: number, workflowId: number, workflowR
   ].join('\n');
   const root = await managedWorkflowRoot(workflowId);
   await ensureDirectory(root);
-  const created = await db.insert(sessions).values({ taskId: task.id, runtime: 'pi', status: 'pending', inputJson: { acceptance: true } });
+  const acceptanceModelId = parseModelId(input.modelId);
+  if (!acceptanceModelId) {
+    const message = `验收节点「${task.name}」未配置模型，请先编辑该 Agent 节点并选择模型`;
+    await saveAcceptanceResult(task, 'unclear', providers.map((item) => item.party.name), rule, message);
+    await pauseAcceptance(projectId, workflowRunId, task, 'unclear', [], message);
+    return { status: 'awaiting' as const, taskId: task.id };
+  }
+  const acceptanceLaunch = piLaunchCredentials(await resolveModelById(acceptanceModelId));
+  const created = await db.insert(sessions).values({ taskId: task.id, runtime: 'pi', status: 'pending', inputJson: { acceptance: true, modelId: acceptanceModelId } });
   const sessionId = created[0].insertId;
   const active = activeWorkflowSessions.get(workflowRunId) ?? new Set<number>();
   active.add(sessionId);
@@ -1460,6 +2003,9 @@ async function reviewAcceptance(projectId: number, workflowId: number, workflowR
       taskId: task.id,
       prompt,
       systemPrompt: '你只按不合格条件给出合格或不合格。满足任意一条就不合格。不要改文件，不要输出改写后的正文。',
+      provider: acceptanceLaunch.provider,
+      model: acceptanceLaunch.model,
+      apiKey: acceptanceLaunch.apiKey,
       workingDirectory: root,
       allowedTools: [],
       onEvent: (event) => {
@@ -1530,11 +2076,86 @@ async function reviewAcceptance(projectId: number, workflowId: number, workflowR
   }
 }
 
+function failureReason(output: unknown, fallback = '执行失败'): string {
+  if (typeof output === 'string' && output.trim()) return output.trim();
+  if (output && typeof output === 'object' && !Array.isArray(output)) {
+    const record = output as Record<string, unknown>;
+    for (const key of ['error', 'message']) {
+      const value = record[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+  }
+  return fallback;
+}
+
+async function markAgentTaskFailed(input: {
+  projectId: number;
+  workflowRunId: number;
+  task: typeof tasks.$inferSelect;
+  sessionId?: number;
+  agentId?: number | null;
+  error: string;
+  errorKind?: 'retryable' | 'human_required' | 'terminal';
+  extras?: Record<string, unknown>;
+  workspacePath?: string;
+}) {
+  const workspacePath = input.workspacePath
+    ?? (typeof jsonObject(input.task.inputJson).workspacePath === 'string'
+      ? String(jsonObject(input.task.inputJson).workspacePath)
+      : undefined);
+  const payload = {
+    ...input.extras,
+    error: input.error,
+    ...(workspacePath ? { workspacePath } : {}),
+  };
+  await db.update(tasks).set({
+    status: 'failed',
+    errorKind: input.errorKind ?? 'human_required',
+    outputJson: payload,
+  }).where(eq(tasks.id, input.task.id));
+  if (input.sessionId) {
+    await db.update(sessions).set({
+      status: 'failed',
+      outputJson: payload,
+      completedAt: new Date(),
+    }).where(eq(sessions.id, input.sessionId));
+  }
+  if (workspacePath && isManagedWorkspace(workspacePath)) {
+    try {
+      await writeResult(workspacePath, `# 执行失败\n\n原因：${input.error}\n`);
+    } catch {
+      /* 写结果失败不影响主流程 */
+    }
+  }
+  await persistAndBroadcastEvent({
+    projectId: input.projectId,
+    workflowRunId: input.workflowRunId,
+    taskId: input.task.id,
+    sessionId: input.sessionId,
+    agentId: input.agentId ?? undefined,
+    type: 'task.failed',
+    payloadJson: { error: input.error, name: input.task.name },
+  });
+  return payload;
+}
+
 async function runWorkflowAgent(projectId: number, workflowId: number, workflowRunId: number, task: typeof tasks.$inferSelect) {
-  const reviewed = await reviewAcceptance(projectId, workflowId, workflowRunId, task);
-  if (reviewed) return reviewed;
-  await prepareTaskWorkspace(workflowId, workflowRunId, task);
-  return executeAgentTask(projectId, workflowRunId, task);
+  try {
+    const reviewed = await reviewAcceptance(projectId, workflowId, workflowRunId, task);
+    if (reviewed) return reviewed;
+    await prepareTaskWorkspace(workflowId, workflowRunId, task);
+    return await executeAgentTask(projectId, workflowRunId, task);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '节点执行失败';
+    const payload = await markAgentTaskFailed({
+      projectId,
+      workflowRunId,
+      task,
+      agentId: task.agentId,
+      error: message,
+    });
+    return { status: 'failed' as const, taskId: task.id, output: payload };
+  }
 }
 
 async function executeWorkflowRun(workflowRunId: number, mode?: 'restart' | 'resume') {
@@ -1614,8 +2235,11 @@ async function executeWorkflowRun(workflowRunId: number, mode?: 'restart' | 'res
     if (!task) {
       const failed = runTasks.find((candidate) => candidate.status === 'failed');
       const error = failed
-        ? { error: `Task ${failed.id} failed`, failedTaskId: failed.id }
-        : { error: 'Task graph is blocked by unsatisfied dependencies' };
+        ? {
+            error: `「${failed.name}」失败：${failureReason(failed.outputJson, '未知原因')}`,
+            failedTaskId: failed.id,
+          }
+        : { error: '任务图被未满足的依赖卡住，无法继续执行' };
       if (!(await finishRunIfStillRunning(workflowRunId, run.workflowId, 'failed', { errorJson: error, completedAt: new Date() }))) {
         return { status: 'cancelled' as const, completedTaskIds };
       }
@@ -1662,7 +2286,12 @@ async function executeWorkflowRun(workflowRunId: number, mode?: 'restart' | 'res
             projectId: run.projectId,
             workflowRunId,
             checkpointId: createdCheckpointId,
-            question: typeof input.question === 'string' ? input.question : `Approve checkpoint: ${task.name}?`,
+            question: (() => {
+              const raw = typeof input.question === 'string' ? input.question.trim() : '';
+              // 旧默认文案 Approve checkpoint: xxx? 不再写入决策
+              if (!raw || /^Approve checkpoint:/i.test(raw)) return '';
+              return raw;
+            })(),
             contextJson: checkpointContext,
           });
           await tx.update(tasks).set({ status: 'awaiting_decision' }).where(eq(tasks.id, task.id));
@@ -1703,40 +2332,83 @@ async function executeAgentTask(projectId: number, workflowRunId: number, task: 
   const input = jsonObject(task.inputJson);
   const taskSessions = await db.select().from(sessions).where(eq(sessions.taskId, task.id)).orderBy(desc(sessions.id));
   const session = taskSessions.find((item) => item.status === 'pending') ?? taskSessions[0];
-  if (!session) return { status: 'failed' as const, taskId: task.id, output: { error: `Task ${task.id} has no session` } };
+  if (!session) {
+    const payload = await markAgentTaskFailed({
+      projectId,
+      workflowRunId,
+      task,
+      agentId: task.agentId,
+      error: `任务「${task.name}」没有可用的执行会话`,
+    });
+    return { status: 'failed' as const, taskId: task.id, output: payload };
+  }
   const sessionInput = { ...input, ...jsonObject(session.inputJson) };
   const explicitAgentId = task.agentId ?? session.agentId ?? undefined;
+  const capabilityKeys = Array.isArray(sessionInput.capabilities)
+    ? sessionInput.capabilities.filter((item): item is string => typeof item === 'string')
+    : [normalizedText(sessionInput.capability), normalizedText(sessionInput.skill)].filter((item): item is string => Boolean(item));
   let agentId: number | undefined;
   let runtimePolicy;
   let resolvedPrompt: string | undefined;
+  let skillRows: SkillRow[] = [];
+  let piProvider: string | undefined;
+  let piModel: string | undefined;
+  let piApiKey: string | undefined;
   try {
-    if (explicitAgentId) {
+    const nodeSkillKeys = collectSkillKeys(sessionInput.skills);
+    const tenantId = await tenantIdOfProject(projectId);
+    const modelId = parseModelId(sessionInput.modelId);
+    if (!modelId) {
+      throw new Error(`请为 Agent「${task.name}」选择模型后再执行`);
+    }
+    const launch = piLaunchCredentials(await resolveModelById(modelId));
+    piProvider = launch.provider;
+    piModel = launch.model;
+    piApiKey = launch.apiKey;
+
+    const capabilityArgs = capabilityKeys.length
+      ? { capabilities: capabilityKeys }
+      : {
+          capability: normalizedText(sessionInput.capability),
+          skill: normalizedText(sessionInput.skill),
+        };
+    // 模型以节点配置为准；Agent 匹配只补充 systemPrompt / Skill 策略
+    try {
       const matched = await resolveAgentModel({
         projectId,
         workflowRunId,
-        agentId: explicitAgentId,
-        ...(Array.isArray(sessionInput.capabilities)
-          ? { capabilities: sessionInput.capabilities.filter((item): item is string => typeof item === 'string') }
-          : {
-              capability: normalizedText(sessionInput.capability),
-              skill: normalizedText(sessionInput.skill),
-            }),
+        ...(explicitAgentId ? { agentId: explicitAgentId } : {}),
+        ...capabilityArgs,
       });
       agentId = matched.agent.id;
-      runtimePolicy = matched.runtimePolicy;
       resolvedPrompt = matched.systemPrompt ?? undefined;
-    } else {
-      const capabilities = Array.isArray(sessionInput.capabilities)
-        ? sessionInput.capabilities.filter((item): item is string => typeof item === 'string')
-        : [normalizedText(sessionInput.capability), normalizedText(sessionInput.skill)].filter((item): item is string => Boolean(item));
-      const nodeRuntime = await resolveWorkflowNode({ projectId, workflowRunId, name: task.name, capabilities });
+      const agentSkills = matched.skills ?? [];
+      skillRows = nodeSkillKeys.length ? await loadAgentSkills(nodeSkillKeys, tenantId) : agentSkills;
+      runtimePolicy = skillRows.length > 0 ? runtimePolicyFromSkills(skillRows) : matched.runtimePolicy;
+    } catch {
+      const nodeRuntime = await resolveWorkflowNode({
+        projectId,
+        workflowRunId,
+        name: task.name,
+        capabilities: capabilityKeys,
+      });
       runtimePolicy = nodeRuntime.runtimePolicy;
       resolvedPrompt = nodeRuntime.systemPrompt;
+      if (nodeSkillKeys.length) {
+        skillRows = await loadAgentSkills(nodeSkillKeys, tenantId);
+        runtimePolicy = skillRows.length > 0 ? runtimePolicyFromSkills(skillRows) : runtimePolicy;
+      }
     }
   } catch (error) {
-    const payload = { error: error instanceof Error ? error.message : '节点执行准备失败' };
-    await db.update(tasks).set({ status: 'failed', errorKind: 'human_required', outputJson: payload }).where(eq(tasks.id, task.id));
-    await db.update(sessions).set({ status: 'failed', outputJson: payload, completedAt: new Date() }).where(eq(sessions.id, session.id));
+    const payload = await markAgentTaskFailed({
+      projectId,
+      workflowRunId,
+      task,
+      sessionId: session.id,
+      agentId: task.agentId ?? session.agentId,
+      error: error instanceof Error ? error.message : '节点执行准备失败',
+      workspacePath: typeof sessionInput.workspacePath === 'string' ? sessionInput.workspacePath : undefined,
+    });
     return { status: 'failed' as const, taskId: task.id, output: payload };
   }
   const prompt = typeof sessionInput.prompt === 'string' ? sessionInput.prompt : `Execute Orvia task: ${task.name}`;
@@ -1751,9 +2423,30 @@ async function executeAgentTask(projectId: number, workflowRunId: number, task: 
         runtimePolicy,
       );
   } catch (error) {
-    const payload = { error: error instanceof Error ? error.message : '工作目录不可用' };
-    await db.update(tasks).set({ status: 'failed', errorKind: 'human_required', outputJson: payload }).where(eq(tasks.id, task.id));
-    await db.update(sessions).set({ status: 'failed', outputJson: payload, completedAt: new Date() }).where(eq(sessions.id, session.id));
+    const payload = await markAgentTaskFailed({
+      projectId,
+      workflowRunId,
+      task,
+      sessionId: session.id,
+      agentId,
+      error: error instanceof Error ? error.message : '工作目录不可用',
+      workspacePath: typeof sessionInput.workspacePath === 'string' ? sessionInput.workspacePath : undefined,
+    });
+    return { status: 'failed' as const, taskId: task.id, output: payload };
+  }
+  let skillPaths: string[] = [];
+  try {
+    skillPaths = await materializeSkillDirs(skillRows, workingDirectory);
+  } catch (error) {
+    const payload = await markAgentTaskFailed({
+      projectId,
+      workflowRunId,
+      task,
+      sessionId: session.id,
+      agentId,
+      error: error instanceof Error ? error.message : 'Skill 准备失败',
+      workspacePath: workingDirectory,
+    });
     return { status: 'failed' as const, taskId: task.id, output: payload };
   }
   const output: string[] = [];
@@ -1762,48 +2455,93 @@ async function executeAgentTask(projectId: number, workflowRunId: number, task: 
   const active = activeWorkflowSessions.get(workflowRunId) ?? new Set<number>();
   active.add(session.id);
   activeWorkflowSessions.set(workflowRunId, active);
-  await piRuntime.start({
-    sessionId: session.id,
-    taskId: task.id,
-    prompt,
-    systemPrompt,
-    workingDirectory,
-    allowedTools: runtimePolicy.allowedTools,
-    deniedTools: runtimePolicy.deniedTools,
-    command: typeof sessionInput.command === 'string' ? sessionInput.command : undefined,
-    onEvent: (runtimeEvent) => {
-      if (runtimeEvent.type === 'stdout' && typeof runtimeEvent.payload === 'string') output.push(runtimeEvent.payload);
-      void emitRuntimeEvent(
-        { projectId, workflowRunId, taskId: task.id, sessionId: session.id, agentId },
-        runtimeEvent.type,
-        runtimeEvent.payload,
-      );
-    },
-  });
+  try {
+    await piRuntime.start({
+      sessionId: session.id,
+      taskId: task.id,
+      prompt,
+      systemPrompt,
+      provider: piProvider,
+      model: piModel,
+      apiKey: piApiKey,
+      workingDirectory,
+      allowedTools: runtimePolicy.allowedTools,
+      deniedTools: runtimePolicy.deniedTools,
+      skillPaths,
+      disableDefaultSkills: true,
+      command: typeof sessionInput.command === 'string' ? sessionInput.command : undefined,
+      onEvent: (runtimeEvent) => {
+        if (runtimeEvent.type === 'stdout' && typeof runtimeEvent.payload === 'string') output.push(runtimeEvent.payload);
+        void emitRuntimeEvent(
+          { projectId, workflowRunId, taskId: task.id, sessionId: session.id, agentId },
+          runtimeEvent.type,
+          runtimeEvent.payload,
+        );
+      },
+    });
+  } catch (error) {
+    active.delete(session.id);
+    const payload = await markAgentTaskFailed({
+      projectId,
+      workflowRunId,
+      task,
+      sessionId: session.id,
+      agentId,
+      error: error instanceof Error ? error.message : '启动 Pi 失败',
+      workspacePath: workingDirectory,
+    });
+    return { status: 'failed' as const, taskId: task.id, output: payload };
+  }
   const completed = await piRuntime.wait(session.id);
   active.delete(session.id);
   if ((await db.select({ status: workflowRuns.status }).from(workflowRuns).where(eq(workflowRuns.id, workflowRunId)))[0]?.status === 'cancelled') {
     return { status: 'cancelled' as const, taskId: task.id, output: completed };
   }
   if (completed.status !== 'completed') {
+    const reason = failureReason(completed, 'Pi 执行失败');
     const canRetry = task.retryCount < task.maxRetries;
+    const failedPayload = { ...completed, error: reason, workspacePath: sessionInput.workspacePath };
     const retrySessionId = await db.transaction(async (tx) => {
       await tx.update(tasks).set({
         status: canRetry ? 'pending' : 'failed',
         retryCount: task.retryCount + 1,
         errorKind: canRetry ? 'retryable' : 'human_required',
-        outputJson: completed,
+        outputJson: failedPayload,
       }).where(eq(tasks.id, task.id));
-      await tx.update(sessions).set({ status: 'failed', outputJson: completed, completedAt: new Date() }).where(eq(sessions.id, session.id));
+      await tx.update(sessions).set({ status: 'failed', outputJson: failedPayload, completedAt: new Date() }).where(eq(sessions.id, session.id));
       if (!canRetry) return undefined;
       const retrySession = await tx.insert(sessions).values({ taskId: task.id, agentId, runtime: session.runtime, status: 'pending', inputJson: session.inputJson });
       return retrySession[0].insertId;
     });
     if (retrySessionId) {
-      await persistAndBroadcastEvent({ projectId, workflowRunId, taskId: task.id, sessionId: retrySessionId, agentId, type: 'task.retry_scheduled', payloadJson: { attempt: task.retryCount + 1 } });
-      return { status: 'retry' as const, taskId: task.id, output: completed };
+      await persistAndBroadcastEvent({
+        projectId,
+        workflowRunId,
+        taskId: task.id,
+        sessionId: retrySessionId,
+        agentId,
+        type: 'task.retry_scheduled',
+        payloadJson: { attempt: task.retryCount + 1, error: reason },
+      });
+      return { status: 'retry' as const, taskId: task.id, output: failedPayload };
     }
-    return { status: 'failed' as const, taskId: task.id, output: completed };
+    if (typeof sessionInput.workspacePath === 'string' && isManagedWorkspace(sessionInput.workspacePath)) {
+      try {
+        await writeResult(sessionInput.workspacePath, `# 执行失败\n\n原因：${reason}\n`);
+      } catch {
+        /* ignore */
+      }
+    }
+    await persistAndBroadcastEvent({
+      projectId,
+      workflowRunId,
+      taskId: task.id,
+      sessionId: session.id,
+      agentId,
+      type: 'task.failed',
+      payloadJson: { error: reason, name: task.name },
+    });
+    return { status: 'failed' as const, taskId: task.id, output: failedPayload };
   }
   const text = output.join('');
   if (typeof sessionInput.workspacePath === 'string' && isManagedWorkspace(sessionInput.workspacePath)) {
@@ -1838,7 +2576,11 @@ async function replanWorkflowRun(workflowRunId: number, reason: string, definiti
     const workflow = (await db.select().from(workflows).where(eq(workflows.id, run.workflowId)))[0];
     if (!workflow) throw new OrviaError('Workflow not found', 'not_found', 404);
     nodeCapabilityLists = definitionNodes.map((node) => nodeCapabilityList(jsonObject(node)));
+    const nodeSkillLists = definitionNodes.map((node) => nodeSkillList(jsonObject(node)));
+    const nodeModelIds = definitionNodes.map((node) => nodeModelId(jsonObject(node)));
     await assertProjectCatalogKeys(workflow.projectId, nodeCapabilityLists.flat());
+    await assertProjectSkillKeys(workflow.projectId, nodeSkillLists.flat());
+    await assertActiveModelIds(nodeModelIds);
   }
   const replanned = await db.transaction(async (tx) => {
     const oldPlans = await tx.select().from(plans).where(eq(plans.workflowRunId, workflowRunId)).orderBy(desc(plans.version));
@@ -1868,6 +2610,17 @@ async function replanWorkflowRun(workflowRunId: number, reason: string, definiti
         created.set(nodeKeys[index] ?? String(index), taskId);
         await tx.insert(sessions).values({ taskId, runtime: 'pi', status: 'pending', inputJson: { ...withoutLegacySkill(item), capabilities, capability: capabilities[0], nodeType } });
       }
+      const startKeys = definitionNodes
+        .map((node, index) => ({ key: nodeKeys[index] ?? String(index), type: storedNodeType(jsonObject(node).type) }))
+        .filter((item) => item.type === 'start')
+        .map((item) => item.key);
+      const reachableKeys = startKeys.length > 0
+        ? reachableFromRoots(
+          nodeKeys,
+          definitionEdges.map((edge) => ({ source: String(jsonObject(edge).source), target: String(jsonObject(edge).target) })),
+          startKeys,
+        )
+        : null;
       for (const [index, node] of definitionNodes.entries()) {
         const key = nodeKeys[index] ?? String(index);
         const taskId = created.get(key);
@@ -1879,10 +2632,27 @@ async function replanWorkflowRun(workflowRunId: number, reason: string, definiti
           .filter((id): id is number => typeof id === 'number');
         const item = jsonObject(node);
         const capabilities = nodeCapabilityLists[index] ?? nodeCapabilityList(item);
+        const unreachable = Boolean(reachableKeys && !reachableKeys.has(key));
+        const status = unreachable ? 'cancelled' as const : (dependencyIds.length > 0 ? 'blocked' as const : 'pending' as const);
         await tx.update(tasks).set({
-          status: dependencyIds.length > 0 ? 'blocked' : 'pending',
-          inputJson: { ...withoutLegacySkill(item), capabilities, capability: capabilities[0], nodeType: storedNodeType(item.type), dependsOnTaskIds: dependencyIds },
+          status,
+          inputJson: {
+            ...withoutLegacySkill(item),
+            capabilities,
+            capability: capabilities[0],
+            nodeType: storedNodeType(item.type),
+            dependsOnTaskIds: dependencyIds,
+            ...(unreachable ? { skippedUnreachable: true } : {}),
+          },
+          ...(unreachable ? { outputJson: { skipped: true, error: '未连接到开始节点，已跳过' } } : {}),
         }).where(eq(tasks.id, taskId));
+        if (unreachable) {
+          await tx.update(sessions).set({
+            status: 'failed',
+            outputJson: { error: '未连接到开始节点，已跳过' },
+            completedAt: new Date(),
+          }).where(eq(sessions.taskId, taskId));
+        }
       }
     } else {
       await tx.update(tasks).set({ planId, status: 'pending', errorKind: null })
@@ -1948,7 +2718,7 @@ function storedNodeType(type: unknown): 'task' | 'checkpoint' | 'start' | 'end' 
 }
 
 function nodeCapabilityList(item: Record<string, unknown>, requireCapabilities = true): string[] {
-  if (item.type === 'start' || item.type === 'end') return [];
+  if (item.type === 'start' || item.type === 'end' || item.type === 'checkpoint') return [];
   const keys = workflowNodeCapabilityKeys(item);
   if (keys.length === 0) {
     if (!requireCapabilities) return [];
@@ -1958,11 +2728,30 @@ function nodeCapabilityList(item: Record<string, unknown>, requireCapabilities =
   return keys;
 }
 
+function nodeSkillList(item: Record<string, unknown>): string[] {
+  if (storedNodeType(item.type) !== 'task') return [];
+  return collectSkillKeys(item.skills);
+}
+
+function nodeModelId(item: Record<string, unknown>, requireModel = true): number | undefined {
+  if (storedNodeType(item.type) !== 'task') return undefined;
+  const modelId = parseModelId(item.modelId);
+  if (!modelId) {
+    if (!requireModel) return undefined;
+    const label = requiredString(item, 'name') ?? requiredString(item, 'key') ?? '未命名 Agent';
+    throw new OrviaError(`请为 Agent「${label}」选择模型`, 'validation', 400);
+  }
+  return modelId;
+}
+
 function prepareWorkflowDefinition(definitionJson: unknown, requireCapabilities: boolean) {
   const definition = jsonObject(definitionJson);
   const definitionNodes = Array.isArray(definition.nodes) ? definition.nodes : [];
   const definitionEdges = Array.isArray(definition.edges) ? definition.edges : [];
   const nodeCapabilityLists = definitionNodes.map((node) => nodeCapabilityList(jsonObject(node), requireCapabilities));
+  const nodeSkillLists = definitionNodes.map((node) => nodeSkillList(jsonObject(node)));
+  // 日常保存节点不强制整图都有模型（旧节点可逐步补）；发布时再统一校验
+  const nodeModelIds = definitionNodes.map((node) => nodeModelId(jsonObject(node), false));
   const nodeKeys = definitionNodes.map((node, index) => requiredString(jsonObject(node), 'key') ?? String(index));
   try {
     assertAcyclicGraph(nodeKeys, definitionEdges.map((edge) => ({
@@ -1979,7 +2768,11 @@ function prepareWorkflowDefinition(definitionJson: unknown, requireCapabilities:
     return { key: requiredString(item, 'key') ?? '', type: storedNodeType(item.type) };
   }));
   if (loopError) throw new OrviaError(loopError, 'validation', 400);
-  return { definitionNodes, definitionEdges, nodeCapabilityLists };
+  return { definitionNodes, definitionEdges, nodeCapabilityLists, nodeSkillLists, nodeModelIds };
+}
+
+function assertTaskNodesHaveModels(definitionNodes: unknown[]) {
+  for (const node of definitionNodes) nodeModelId(jsonObject(node), true);
 }
 
 async function insertWorkflowGraph(
@@ -2123,7 +2916,7 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       response.writeHead(204, {
         'access-control-allow-origin': config.webOrigin,
         'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
-        'access-control-allow-headers': 'content-type, authorization, x-orvia-tenant-id, x-orvia-filename',
+        'access-control-allow-headers': 'content-type, authorization, x-orvia-tenant-id, x-orvia-filename, x-orvia-skill-key, x-orvia-skill-name, x-orvia-skill-description, x-orvia-skill-tools',
       });
       return response.end();
     }
@@ -2369,7 +3162,23 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
 
     if (request.method === 'GET' && url.pathname === '/api/model-providers') {
       const rows = await db.select().from(modelProviders).orderBy(asc(modelProviders.name));
-      return sendJson(response, 200, { data: rows });
+      return sendJson(response, 200, {
+        data: rows.map((row) => {
+          const publicConfig = publicProviderConfig(row.configJson);
+          return {
+            id: row.id,
+            name: row.name,
+            type: row.type,
+            baseUrl: row.baseUrl,
+            status: row.status,
+            apiKeySet: publicConfig.apiKeySet,
+            apiKeyMasked: publicConfig.apiKeyMasked,
+            configJson: publicConfig.configJson,
+            createdAt: row.createdAt,
+            updatedAt: row.updatedAt,
+          };
+        }),
+      });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/model-providers') {
@@ -2381,13 +3190,22 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       if (baseUrl && !/^https?:\/\//i.test(baseUrl)) {
         return sendJson(response, 400, { error: 'baseUrl must start with http:// or https://' });
       }
+      const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+      if (!apiKey) return sendJson(response, 400, { error: '请填写 API Key，执行时会传给 Pi' });
+      const configJson = withProviderApiKey(body.configJson, apiKey);
       const result = await db.insert(modelProviders).values({
         name: body.name,
         type: body.type,
         baseUrl: baseUrl || undefined,
-        configJson: body.configJson,
+        configJson,
       });
-      return sendJson(response, 201, { id: result[0].insertId, name: body.name, type: body.type });
+      return sendJson(response, 201, {
+        id: result[0].insertId,
+        name: body.name,
+        type: body.type,
+        apiKeySet: true,
+        apiKeyMasked: publicProviderConfig(configJson).apiKeyMasked,
+      });
     }
 
     const providerDetailMatch = url.pathname.match(/^\/api\/model-providers\/(\d+)$/);
@@ -2400,8 +3218,33 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       const type = requiredString(body, 'type') ?? existing.type;
       const baseUrl = typeof body.baseUrl === 'string' ? body.baseUrl.trim() : existing.baseUrl ?? '';
       if (baseUrl && !/^https?:\/\//i.test(baseUrl)) return sendJson(response, 400, { error: 'baseUrl must start with http:// or https://' });
-      await db.update(modelProviders).set({ name, type, baseUrl: baseUrl || null }).where(eq(modelProviders.id, providerId));
-      return sendJson(response, 200, { id: providerId, name, type, baseUrl: baseUrl || null });
+      let configJson = existing.configJson;
+      if (typeof body.apiKey === 'string') {
+        const nextKey = body.apiKey.trim();
+        if (nextKey) configJson = withProviderApiKey(existing.configJson, nextKey);
+        // 空字符串表示保留原 key，不清除；要清除需显式 clearApiKey
+      }
+      if (body.clearApiKey === true) {
+        configJson = withProviderApiKey(existing.configJson, '');
+      }
+      if (!apiKeyFromProviderConfig(configJson)) {
+        return sendJson(response, 400, { error: '请填写 API Key，执行时会传给 Pi' });
+      }
+      await db.update(modelProviders).set({
+        name,
+        type,
+        baseUrl: baseUrl || null,
+        configJson,
+      }).where(eq(modelProviders.id, providerId));
+      const publicConfig = publicProviderConfig(configJson);
+      return sendJson(response, 200, {
+        id: providerId,
+        name,
+        type,
+        baseUrl: baseUrl || null,
+        apiKeySet: publicConfig.apiKeySet,
+        apiKeyMasked: publicConfig.apiKeyMasked,
+      });
     }
 
     if (request.method === 'GET' && url.pathname === '/api/models') {
@@ -2533,6 +3376,199 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       return sendJson(response, 200, { id: capabilityId, key: existing.key, name });
     }
 
+    if (request.method === 'GET' && url.pathname === '/api/skills') {
+      if (!auth) return sendJson(response, 401, { error: 'Unauthorized' });
+      const rows = await ensureTenantSkills(auth.tenantId);
+      return sendJson(response, 200, { data: rows });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/skills') {
+      if (!auth) return sendJson(response, 401, { error: 'Unauthorized' });
+      const body = await readJson(request);
+      const key = typeof body.key === 'string' ? normalizeSkillKey(body.key) : undefined;
+      const name = requiredString(body, 'name') ?? key;
+      if (!key || !name) return sendJson(response, 400, { error: '请填写合法的 Skill 标识和中文名称' });
+      await ensureTenantSkills(auth.tenantId);
+      const duplicate = (await db.select().from(skills).where(and(eq(skills.tenantId, auth.tenantId), eq(skills.key, key))))[0];
+      if (duplicate) return sendJson(response, 400, { error: '这个 Skill 标识已经在目录里' });
+      const description = typeof body.description === 'string' ? body.description.trim() : '';
+      const contentMd = typeof body.contentMd === 'string' ? body.contentMd : '';
+      const toolsJson = body.toolsJson && typeof body.toolsJson === 'object' && !Array.isArray(body.toolsJson)
+        ? body.toolsJson
+        : { allow: ['bash'] as string[] };
+      const installed = await installSkillMarkdown({ tenantId: auth.tenantId, skillKey: key, contentMd });
+      const result = await db.insert(skills).values({
+        tenantId: auth.tenantId,
+        key,
+        name,
+        description: description || null,
+        kind: 'custom',
+        toolsJson,
+        contentMd: installed.contentMd,
+        configJson: { source: 'markdown', files: installed.files },
+        status: 'active',
+      });
+      return sendJson(response, 201, { id: result[0].insertId, tenantId: auth.tenantId, key, name, kind: 'custom' });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/skills/import') {
+      if (!auth) return sendJson(response, 401, { error: 'Unauthorized' });
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) {
+        const piece = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        chunks.push(piece);
+      }
+      const payload = Buffer.concat(chunks);
+      const encodedName = request.headers['x-orvia-filename'];
+      const filename = typeof encodedName === 'string' && encodedName
+        ? decodeURIComponent(encodedName)
+        : 'skill.zip';
+      const headerKey = typeof request.headers['x-orvia-skill-key'] === 'string' ? request.headers['x-orvia-skill-key'] : '';
+      const headerName = typeof request.headers['x-orvia-skill-name'] === 'string' ? decodeURIComponent(request.headers['x-orvia-skill-name']) : '';
+      const headerDescription = typeof request.headers['x-orvia-skill-description'] === 'string'
+        ? decodeURIComponent(request.headers['x-orvia-skill-description'])
+        : '';
+      const headerTools = typeof request.headers['x-orvia-skill-tools'] === 'string' ? request.headers['x-orvia-skill-tools'] : 'bash';
+      const key = normalizeSkillKey(headerKey);
+      if (!key) return sendJson(response, 400, { error: '请填写合法的 Skill 标识' });
+      await ensureTenantSkills(auth.tenantId);
+      const duplicate = (await db.select().from(skills).where(and(eq(skills.tenantId, auth.tenantId), eq(skills.key, key))))[0];
+      if (duplicate) return sendJson(response, 400, { error: '这个 Skill 标识已经在目录里' });
+
+      const lower = filename.toLowerCase();
+      const isZip = lower.endsWith('.zip');
+      const isMd = lower.endsWith('.md') || lower.endsWith('.markdown');
+      if (!isZip && !isMd) return sendJson(response, 400, { error: '请上传 .zip Skill 包，或单个 .md / SKILL.md 文件' });
+
+      let contentMd = '';
+      let files: string[] = [];
+      let source: 'package' | 'markdown' = 'markdown';
+      if (isZip) {
+        const installed = await installSkillZipPackage({ tenantId: auth.tenantId, skillKey: key, zip: payload });
+        contentMd = installed.contentMd;
+        files = installed.files;
+        source = 'package';
+      } else {
+        const installed = await installSkillMarkdown({
+          tenantId: auth.tenantId,
+          skillKey: key,
+          contentMd: payload.toString('utf8'),
+        });
+        contentMd = installed.contentMd;
+        files = installed.files;
+      }
+      const meta = parseSkillFrontmatter(contentMd);
+      const name = headerName.trim() || meta.name || key;
+      const description = headerDescription.trim() || meta.description || '';
+      const toolsAllow = headerTools.split(/[,，\s]+/).map((item) => item.trim()).filter(Boolean);
+      const result = await db.insert(skills).values({
+        tenantId: auth.tenantId,
+        key,
+        name,
+        description: description || null,
+        kind: 'custom',
+        toolsJson: { allow: toolsAllow.length ? toolsAllow : ['bash'] },
+        contentMd,
+        configJson: { source, files, filename },
+        status: 'active',
+      });
+      return sendJson(response, 201, {
+        id: result[0].insertId,
+        tenantId: auth.tenantId,
+        key,
+        name,
+        kind: 'custom',
+        source,
+        files,
+      });
+    }
+
+    const skillDetailMatch = url.pathname.match(/^\/api\/skills\/(\d+)$/);
+    if ((request.method === 'PATCH' || request.method === 'PUT') && skillDetailMatch) {
+      if (!auth) return sendJson(response, 401, { error: 'Unauthorized' });
+      const skillId = Number(skillDetailMatch[1]);
+      const body = await readJson(request);
+      const existing = (await db.select().from(skills).where(eq(skills.id, skillId)))[0];
+      if (!existing || existing.tenantId !== auth.tenantId) return sendJson(response, 404, { error: 'Skill not found' });
+      if (existing.kind === 'builtin') {
+        const description = typeof body.description === 'string' ? body.description.trim() : existing.description;
+        await db.update(skills).set({ description: description || null }).where(eq(skills.id, skillId));
+        return sendJson(response, 200, { id: skillId, key: existing.key, name: existing.name, kind: existing.kind });
+      }
+      const name = requiredString(body, 'name') ?? existing.name;
+      if (!name) return sendJson(response, 400, { error: '请填写中文名称' });
+      const description = typeof body.description === 'string' ? body.description.trim() : existing.description;
+      const contentMd = typeof body.contentMd === 'string' ? body.contentMd : existing.contentMd;
+      const toolsJson = body.toolsJson === undefined
+        ? existing.toolsJson
+        : (body.toolsJson && typeof body.toolsJson === 'object' && !Array.isArray(body.toolsJson) ? body.toolsJson : existing.toolsJson);
+      if (typeof contentMd === 'string' && contentMd.trim()) {
+        await syncSkillMarkdownFile(existing.tenantId, existing.key, contentMd);
+      }
+      await db.update(skills).set({
+        name,
+        description: description || null,
+        contentMd: contentMd || null,
+        toolsJson,
+      }).where(eq(skills.id, skillId));
+      return sendJson(response, 200, { id: skillId, key: existing.key, name, kind: existing.kind });
+    }
+
+    if (request.method === 'DELETE' && skillDetailMatch) {
+      if (!auth) return sendJson(response, 401, { error: 'Unauthorized' });
+      const skillId = Number(skillDetailMatch[1]);
+      const existing = (await db.select().from(skills).where(eq(skills.id, skillId)))[0];
+      if (!existing || existing.tenantId !== auth.tenantId) return sendJson(response, 404, { error: 'Skill not found' });
+      if (existing.kind === 'builtin') return sendJson(response, 400, { error: '系统内置 Skill 不能删除' });
+      await db.delete(skills).where(eq(skills.id, skillId));
+      await removeSkillStore(existing.tenantId, existing.key);
+      return sendJson(response, 200, { id: skillId, deleted: true });
+    }
+
+    const skillReimportMatch = url.pathname.match(/^\/api\/skills\/(\d+)\/import$/);
+    if (request.method === 'POST' && skillReimportMatch) {
+      if (!auth) return sendJson(response, 401, { error: 'Unauthorized' });
+      const skillId = Number(skillReimportMatch[1]);
+      const existing = (await db.select().from(skills).where(eq(skills.id, skillId)))[0];
+      if (!existing || existing.tenantId !== auth.tenantId) return sendJson(response, 404, { error: 'Skill not found' });
+      if (existing.kind === 'builtin') return sendJson(response, 400, { error: '系统内置 Skill 不能替换包' });
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) {
+        const piece = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        chunks.push(piece);
+      }
+      const payload = Buffer.concat(chunks);
+      const encodedName = request.headers['x-orvia-filename'];
+      const filename = typeof encodedName === 'string' && encodedName ? decodeURIComponent(encodedName) : 'skill.zip';
+      const lower = filename.toLowerCase();
+      let contentMd = existing.contentMd ?? '';
+      let files: string[] = [];
+      let source: 'package' | 'markdown' = 'markdown';
+      if (lower.endsWith('.zip')) {
+        const installed = await installSkillZipPackage({ tenantId: existing.tenantId, skillKey: existing.key, zip: payload });
+        contentMd = installed.contentMd;
+        files = installed.files;
+        source = 'package';
+      } else if (lower.endsWith('.md') || lower.endsWith('.markdown')) {
+        const installed = await installSkillMarkdown({
+          tenantId: existing.tenantId,
+          skillKey: existing.key,
+          contentMd: payload.toString('utf8'),
+        });
+        contentMd = installed.contentMd;
+        files = installed.files;
+      } else {
+        return sendJson(response, 400, { error: '请上传 .zip Skill 包，或单个 .md 文件' });
+      }
+      const meta = parseSkillFrontmatter(contentMd);
+      await db.update(skills).set({
+        contentMd,
+        description: existing.description || meta.description || null,
+        configJson: { source, files, filename },
+      }).where(eq(skills.id, skillId));
+      return sendJson(response, 200, { id: skillId, key: existing.key, source, files });
+    }
+
     if (request.method === 'GET' && url.pathname === '/api/agents') {
       const projectId = queryId(url, 'projectId');
       const workflowId = queryId(url, 'workflowId');
@@ -2571,12 +3607,14 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
         workflowId = parsed;
       }
       const capabilityKeys = await assertProjectCatalogKeys(projectId, collectCapabilityKeys(body.capabilitiesJson));
+      const skillKeys = await assertProjectSkillKeys(projectId, collectSkillKeys(body.skillsJson));
       const result = await db.insert(agents).values({
         projectId,
         workflowId,
         name,
         description: typeof body.description === 'string' ? body.description : undefined,
         capabilitiesJson: capabilityKeys,
+        skillsJson: skillKeys,
       });
       return sendJson(response, 201, { id: result[0].insertId, projectId, workflowId, name });
     }
@@ -2594,9 +3632,13 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       const capabilityKeys = body.capabilitiesJson === undefined
         ? undefined
         : await assertProjectCatalogKeys(existing.projectId, collectCapabilityKeys(body.capabilitiesJson));
+      const skillKeys = body.skillsJson === undefined
+        ? undefined
+        : await assertProjectSkillKeys(existing.projectId, collectSkillKeys(body.skillsJson));
       await db.update(agents).set({
         name,
         capabilitiesJson: capabilityKeys === undefined ? existing.capabilitiesJson : capabilityKeys,
+        skillsJson: skillKeys === undefined ? existing.skillsJson : skillKeys,
       }).where(eq(agents.id, agentId));
       return sendJson(response, 200, { id: agentId, name });
     }
@@ -2789,6 +3831,22 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       }
     }
 
+    const nodeMessageStopMatch = url.pathname.match(/^\/api\/workflows\/(\d+)\/nodes\/([^/]+)\/messages\/stop$/);
+    if (nodeMessageStopMatch && request.method === 'POST') {
+      const workflowId = Number(nodeMessageStopMatch[1]);
+      const nodeKey = decodeURIComponent(nodeMessageStopMatch[2]);
+      const workflow = (await db.select().from(workflows).where(eq(workflows.id, workflowId)))[0];
+      if (!workflow) return sendJson(response, 404, { error: 'Workflow not found' });
+      const node = (await db.select().from(workflowNodes).where(eq(workflowNodes.workflowId, workflowId)))
+        .find((item) => recordKey(item.configJson) === nodeKey);
+      if (!node) return sendJson(response, 404, { error: '节点不存在' });
+      if (node.nodeType === 'start' || node.nodeType === 'end') return sendJson(response, 400, { error: '开始和结束不参与对话' });
+      await readJson(request);
+      const interrupted = await interruptNodeChat(workflowId, nodeKey);
+      if (!interrupted) return sendJson(response, 409, { error: '当前没有进行中的回复' });
+      return sendJson(response, 200, { status: 'interrupted' });
+    }
+
     const nodeMessageMatch = url.pathname.match(/^\/api\/workflows\/(\d+)\/nodes\/([^/]+)\/messages$/);
     if (nodeMessageMatch && (request.method === 'GET' || request.method === 'POST')) {
       const workflowId = Number(nodeMessageMatch[1]);
@@ -2809,6 +3867,21 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       const body = await readJson(request);
       const content = requiredString(body, 'content');
       if (!content) return sendJson(response, 400, { error: '请先写一句指导' });
+      // 人工复核不跑模型：只记下指导，写入后续 checkpoint 说明
+      if (node.nodeType === 'checkpoint') {
+        const owner = (await db.select({ currentVersionId: workflows.currentVersionId }).from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
+        const workflowVersionId = owner?.currentVersionId ?? undefined;
+        await db.insert(nodeMessages).values({ workflowId, workflowVersionId, nodeKey, role: 'user', content, status: 'completed' });
+        await db.insert(nodeMessages).values({
+          workflowId,
+          workflowVersionId,
+          nodeKey,
+          role: 'assistant',
+          content: '已记下，会写进这次复核说明。',
+          status: 'completed',
+        });
+        return sendJson(response, 202, { status: 'accepted' });
+      }
       const chatKey = `${workflowId}:${nodeKey}`;
       if (!(await beginNodeChat(workflowId, nodeKey))) {
         return sendJson(response, 409, { error: '这个 Agent 正在回复，请稍候' });
@@ -2955,6 +4028,9 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
         return sendJson(response, 400, { error: '请至少添加一个节点' });
       }
       await assertProjectCatalogKeys(workflow.projectId, prepared.nodeCapabilityLists.flat());
+      await assertProjectSkillKeys(workflow.projectId, prepared.nodeSkillLists.flat());
+      // 日常 PATCH 只校验已填写的 modelId 是否有效；缺模型的旧节点允许先保存，发布时再强制补齐
+      await assertActiveModelIds(prepared.nodeModelIds);
       await db.transaction(async (tx) => {
         await tx.update(workflows).set({
           name,
@@ -3009,7 +4085,10 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       }
       const status = body.status === 'draft' ? 'draft' : 'published';
       const prepared = prepareWorkflowDefinition(body.definitionJson, status === 'published');
+      if (status === 'published') assertTaskNodesHaveModels(prepared.definitionNodes);
       await assertProjectCatalogKeys(projectId, prepared.nodeCapabilityLists.flat());
+      await assertProjectSkillKeys(projectId, prepared.nodeSkillLists.flat());
+      if (status === 'published') await assertActiveModelIds(prepared.nodeModelIds);
       const created = await db.transaction(async (tx) => {
         const result = await tx.insert(workflows).values({
           projectId,
@@ -3112,11 +4191,20 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
         });
         const planId = planResult[0].insertId;
         const planned = [];
+        const startIds = nodes.filter((node) => node.nodeType === 'start').map((node) => node.id);
+        const reachable = startIds.length > 0
+          ? reachableFromRoots(
+            nodes.map((node) => node.id),
+            edges.map((edge) => ({ source: edge.sourceNodeId, target: edge.targetNodeId })),
+            startIds,
+          )
+          : null;
         for (const node of nodes) {
           const dependsOnNodeIds = edges.filter((edge) => edge.targetNodeId === node.id).map((edge) => edge.sourceNodeId);
           const capabilities = storedNodeCapabilityKeys(node);
-          if (capabilities.length === 0 && node.nodeType !== 'start' && node.nodeType !== 'end') throw new OrviaError(`请为 Agent「${node.name}」选择能力`, 'validation', 400);
+          if (capabilities.length === 0 && node.nodeType === 'task') throw new OrviaError(`请为 Agent「${node.name}」选择能力`, 'validation', 400);
           const nodeConfig = withoutLegacySkill(jsonObject(node.configJson));
+          const status = plannedTaskStatus(node.id, dependsOnNodeIds, reachable);
           const inputJson: Record<string, unknown> = {
             ...(jsonObject(body.inputJson)),
             ...nodeConfig,
@@ -3125,6 +4213,7 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
             workflowNodeId: node.id,
             nodeType: node.nodeType,
             dependsOnNodeIds,
+            ...(status === 'cancelled' ? { skippedUnreachable: true } : {}),
           };
           delete inputJson.skill;
           const taskResult = await tx.insert(tasks).values({
@@ -3132,18 +4221,20 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
             planId,
             workflowNodeId: node.id,
             name: node.name,
-            status: dependsOnNodeIds.length > 0 ? 'blocked' : 'pending',
+            status,
             maxRetries: typeof nodeConfig.maxRetries === 'number' ? nodeConfig.maxRetries : 0,
             inputJson,
+            ...(status === 'cancelled' ? { outputJson: { skipped: true, error: '未连接到开始节点，已跳过' } } : {}),
           });
           const taskId = taskResult[0].insertId;
           const sessionResult = await tx.insert(sessions).values({
             taskId,
             runtime: 'pi',
-            status: 'pending',
+            status: status === 'cancelled' ? 'failed' : 'pending',
             inputJson,
+            ...(status === 'cancelled' ? { outputJson: { error: '未连接到开始节点，已跳过' }, completedAt: new Date() } : {}),
           });
-          planned.push({ nodeId: node.id, taskId, sessionId: sessionResult[0].insertId, capabilities, capability: capabilities[0], nodeType: node.nodeType, dependsOnNodeIds });
+          planned.push({ nodeId: node.id, taskId, sessionId: sessionResult[0].insertId, capabilities, capability: capabilities[0], nodeType: node.nodeType, dependsOnNodeIds, status });
         }
         return { workflowRunId, planId, planned };
       });
@@ -3346,10 +4437,33 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
       if (executingWorkflowRuns.has(workflowRunId)) {
         return sendJson(response, 409, { error: '当前 Run 正在运行，请先停止后再执行' });
       }
-      if (!(await redisRuntime().acquireLock(`run:${workflowRunId}`, 3600))) {
+      // 失败/结束后偶发锁未释放时，允许清掉再执行，避免必须先点停止
+      let locked = await redisRuntime().acquireLock(`run:${workflowRunId}`, 3600);
+      if (!locked && (run.status === 'failed' || run.status === 'completed' || run.status === 'cancelled' || run.status === 'paused' || run.status === 'awaiting_decision')) {
+        await redisRuntime().releaseLock(`run:${workflowRunId}`);
+        locked = await redisRuntime().acquireLock(`run:${workflowRunId}`, 3600);
+      }
+      if (!locked) {
         return sendJson(response, 409, { error: '当前 Run 正在运行，请先停止后再执行' });
       }
-      scheduleWorkflowExecution(workflowRunId, mode);
+      try {
+        if (mode === 'restart') {
+          // 先同步重建任务图并作废旧复核，再异步开跑；避免前端立刻 loadRun 仍看到「待确认」
+          await rebuildWorkflowRunGraph(workflowRunId, run.workflowId);
+          await db.update(workflowRuns).set({
+            status: 'paused',
+            completedAt: null,
+            errorJson: null,
+          }).where(eq(workflowRuns.id, workflowRunId));
+          await rememberRunStatus(workflowRunId, 'paused', run.workflowId);
+          scheduleWorkflowExecution(workflowRunId);
+        } else {
+          scheduleWorkflowExecution(workflowRunId, mode);
+        }
+      } catch (error) {
+        await redisRuntime().releaseLock(`run:${workflowRunId}`);
+        throw error;
+      }
       return sendJson(response, 202, { workflowRunId, status: 'accepted' });
     }
 
@@ -3510,20 +4624,44 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
     if (request.method === 'POST' && decisionMatch) {
       const decisionId = Number(decisionMatch[1]);
       const body = await readJson(request);
-      const decision = requiredString(body, 'decision');
-      const action = ['approve', 'request_changes', 'reject', 'override', 'replan', 'repeat'].includes(String(body.action))
-        ? String(body.action) as 'approve' | 'request_changes' | 'reject' | 'override' | 'replan' | 'repeat'
+      const rawAction = String(body.action);
+      // return：UI 退回；库枚举无 return，落库用 request_changes
+      const action = ['approve', 'return', 'request_changes', 'reject', 'override', 'replan', 'repeat'].includes(rawAction)
+        ? rawAction as 'approve' | 'return' | 'request_changes' | 'reject' | 'override' | 'replan' | 'repeat'
         : body.status === 'rejected' ? 'reject' : 'approve';
-      const status = action === 'approve' ? 'approved'
-        : action === 'request_changes' || action === 'replan' || action === 'repeat' ? 'changes_requested'
-          : action === 'override' ? 'overridden' : 'rejected';
+      const returning = action === 'return' || action === 'request_changes' || action === 'repeat';
+      const storedAction = action === 'return' ? 'request_changes' as const : action;
+      const status = action === 'approve' || action === 'override' ? (action === 'override' ? 'overridden' : 'approved')
+        : returning || action === 'replan' ? 'changes_requested'
+          : 'rejected';
+      const reviewItems = Array.isArray(body.reviews) ? body.reviews.flatMap((item: unknown) => {
+        const record = jsonObject(item);
+        const key = typeof record.key === 'string' ? record.key.trim() : '';
+        const note = typeof record.note === 'string' ? record.note.trim()
+          : typeof record.reason === 'string' ? record.reason.trim() : '';
+        const name = typeof record.name === 'string' ? record.name.trim() : key;
+        if (!key) return [];
+        return [{ key, name, note, action: typeof record.action === 'string' ? record.action : action }];
+      }) : [];
+      const decision = (requiredString(body, 'decision')
+        || reviewItems.filter((item) => item.note).map((item) => `【${item.name}】${item.note}`).join('\n')
+        || '').trim();
       if (!decision) return sendJson(response, 400, { error: 'decision is required' });
       const row = (await db.select().from(decisions).where(eq(decisions.id, decisionId)))[0];
       if (!row) return sendJson(response, 404, { error: 'Decision not found' });
       if (row.status !== 'pending') return sendJson(response, 409, { error: 'Decision is already resolved' });
+      const nextContext = {
+        ...jsonObject(row.contextJson),
+        ...(reviewItems.length ? { reviews: reviewItems } : {}),
+      };
       await db.transaction(async (tx) => {
-        const claimed = await tx.update(decisions).set({ decision, action, status, resolvedAt: new Date() })
-          .where(and(eq(decisions.id, decisionId), eq(decisions.status, 'pending')));
+        const claimed = await tx.update(decisions).set({
+          decision,
+          action: storedAction,
+          status,
+          resolvedAt: new Date(),
+          contextJson: nextContext,
+        }).where(and(eq(decisions.id, decisionId), eq(decisions.status, 'pending')));
         if (claimed[0].affectedRows !== 1) {
           throw new OrviaError('Decision is already resolved', 'conflict', 409);
         }
@@ -3531,7 +4669,7 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
           await tx.update(checkpoints).set({
             status: action === 'approve' ? 'approved'
               : action === 'override' ? 'overridden'
-                : action === 'request_changes' || action === 'replan' || action === 'repeat' ? 'changes_requested' : 'rejected',
+                : returning || action === 'replan' ? 'changes_requested' : 'rejected',
             resolvedAt: new Date(),
           }).where(eq(checkpoints.id, row.checkpointId));
         }
@@ -3540,7 +4678,7 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
         const decisionContext = jsonObject(row.contextJson);
         if (decisionContext.kind === 'acceptance') {
           const checkerTaskId = Number(decisionContext.checkerTaskId);
-          if (action === 'repeat') {
+          if (returning) {
             const owner = (await db.select({ workflowId: workflowRuns.workflowId }).from(workflowRuns).where(eq(workflowRuns.id, row.workflowRunId)))[0];
             const checker = checkerTaskId ? (await db.select().from(tasks).where(eq(tasks.id, checkerTaskId)))[0] : undefined;
             const targets = Array.isArray(decisionContext.targets) ? decisionContext.targets : [];
@@ -3572,18 +4710,42 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
           await persistAndBroadcastEvent({ projectId: row.projectId, workflowRunId: row.workflowRunId, type: `decision.${action}`, payloadJson: { decisionId, decision } });
           return sendJson(response, 200, { id: decisionId, decision, action, status });
         }
-        if (action === 'repeat') {
-          const outcome = await repeatWorkflowLoop(row.workflowRunId, row.checkpointId);
-          if (outcome === 'exhausted') {
-            await db.update(workflowRuns).set({ status: 'failed', errorJson: { error: '循环次数已用尽' }, completedAt: new Date() }).where(eq(workflowRuns.id, row.workflowRunId));
-            await rememberRunStatus(row.workflowRunId, 'failed');
-          } else {
-            scheduleWorkflowExecution(row.workflowRunId);
-          }
-        } else if (action === 'replan' || action === 'request_changes') {
+        if (returning) {
+          const owner = (await db.select({ workflowId: workflowRuns.workflowId }).from(workflowRuns).where(eq(workflowRuns.id, row.workflowRunId)))[0];
+          if (!owner || !row.checkpointId) throw new OrviaError('这个决策没有对应的检查点', 'validation', 400);
+          const targetReviews = reviewItems
+            .filter((item) => item.note && (item.action === 'return' || item.action === 'request_changes' || !item.action || item.action === action))
+            .map((item) => ({ key: item.key, reason: item.note }));
+          await returnCheckpointToUpstream(
+            row.projectId,
+            owner.workflowId,
+            row.workflowRunId,
+            row.checkpointId,
+            decision,
+            targetReviews.length ? targetReviews : undefined,
+            decisionId,
+          );
+          scheduleWorkflowExecution(row.workflowRunId);
+        } else if (action === 'replan') {
           await replanWorkflowRun(row.workflowRunId, decision);
           scheduleWorkflowExecution(row.workflowRunId);
         } else if (action === 'reject') {
+          if (row.checkpointId && reviewItems.length) {
+            const checkpoint = (await db.select().from(checkpoints).where(eq(checkpoints.id, row.checkpointId)))[0];
+            if (checkpoint?.taskId) {
+              const checker = (await db.select().from(tasks).where(eq(tasks.id, checkpoint.taskId)))[0];
+              if (checker) {
+                await db.update(tasks).set({
+                  inputJson: withCheckpointNodeReviewHistory(checker.inputJson, decisionId, reviewItems.map((item) => ({
+                    key: item.key,
+                    name: item.name,
+                    note: item.note,
+                    action: 'reject',
+                  }))),
+                }).where(eq(tasks.id, checker.id));
+              }
+            }
+          }
           queuedWorkflowRuns.delete(row.workflowRunId);
           await stopActiveWorkflowSessions(row.workflowRunId);
           const current = (await db.select({ status: workflowRuns.status }).from(workflowRuns).where(eq(workflowRuns.id, row.workflowRunId)))[0];
@@ -3593,13 +4755,33 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
         } else {
           if (row.checkpointId) {
             const checkpoint = (await db.select().from(checkpoints).where(eq(checkpoints.id, row.checkpointId)))[0];
-            if (checkpoint?.taskId) await db.update(tasks).set({ status: 'completed', outputJson: { decisionId, action } }).where(eq(tasks.id, checkpoint.taskId));
+            if (checkpoint?.taskId) {
+              const checker = (await db.select().from(tasks).where(eq(tasks.id, checkpoint.taskId)))[0];
+              const inputJson = checker
+                ? withCheckpointNodeReviewHistory(checker.inputJson, decisionId, reviewItems.map((item) => ({
+                  key: item.key,
+                  name: item.name,
+                  note: item.note,
+                  action: action === 'override' ? 'approve' : action,
+                })))
+                : undefined;
+              await db.update(tasks).set({
+                status: 'completed',
+                outputJson: { decisionId, action },
+                ...(inputJson ? { inputJson } : {}),
+              }).where(eq(tasks.id, checkpoint.taskId));
+            }
           }
           await db.update(workflowRuns).set({ status: 'paused' }).where(eq(workflowRuns.id, row.workflowRunId));
           await rememberRunStatus(row.workflowRunId, 'paused');
           scheduleWorkflowExecution(row.workflowRunId);
         }
-        await persistAndBroadcastEvent({ projectId: row.projectId, workflowRunId: row.workflowRunId, type: `decision.${action}`, payloadJson: { decisionId, decision } });
+        await persistAndBroadcastEvent({
+          projectId: row.projectId,
+          workflowRunId: row.workflowRunId,
+          type: `decision.${action}`,
+          payloadJson: { decisionId, decision, reviews: reviewItems },
+        });
       }
       return sendJson(response, 200, { id: decisionId, decision, action, status });
     }
@@ -3720,7 +4902,9 @@ async function startServer() {
   const schemaIssues = await schemaIntegrityIssues();
   if (schemaIssues.length > 0) throw new Error(`Database schema is incomplete: ${schemaIssues.join(', ')}`);
   await bootstrapTenancy();
-  await ensureTenantCapabilities(await defaultTenantId());
+  const tenantId = await defaultTenantId();
+  await ensureTenantCapabilities(tenantId);
+  await ensureTenantSkills(tenantId);
   await connectRedis();
   await redisRuntime().subscribe('orvia:events', (message) => {
     const envelope = JSON.parse(message) as { projectId: number };

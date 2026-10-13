@@ -111,6 +111,23 @@ const statements = [
     UNIQUE KEY workflow_versions_workflow_seq_unique (workflow_id, seq),
     CONSTRAINT ov_workflow_versions_workflow_fk FOREIGN KEY (workflow_id) REFERENCES ov_workflows (id)
   )`,
+  `CREATE TABLE IF NOT EXISTS ov_skills (
+    id int NOT NULL AUTO_INCREMENT,
+    tenant_id int NOT NULL,
+    skill_key varchar(120) NOT NULL,
+    name varchar(160) NOT NULL,
+    description text,
+    skill_kind enum('builtin','custom') NOT NULL DEFAULT 'custom',
+    tools_json json,
+    content_md text,
+    config_json json,
+    status enum('active','inactive','draft','published','archived') NOT NULL DEFAULT 'active',
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY skills_tenant_key_unique (tenant_id, skill_key),
+    CONSTRAINT ov_skills_tenant_fk FOREIGN KEY (tenant_id) REFERENCES ov_tenants (id)
+  )`,
   `CREATE TABLE IF NOT EXISTS ov_agents (
     id int NOT NULL AUTO_INCREMENT,
     project_id int NOT NULL,
@@ -118,6 +135,7 @@ const statements = [
     name varchar(160) NOT NULL,
     description text,
     capabilities_json json,
+    skills_json json,
     created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),

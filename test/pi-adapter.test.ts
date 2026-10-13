@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { parsePiOutputLine, PiRuntimeAdapter } from '../src/runtime/pi-adapter.js';
+import { parsePiOutputLine, PiRuntimeAdapter, redactPiArgs } from '../src/runtime/pi-adapter.js';
 
 test('Pi output parser exposes assistant text without protocol events', () => {
   assert.deepEqual(
@@ -40,8 +40,13 @@ test('PiRuntimeAdapter starts a process and waits for completion', async () => {
     taskId: 1,
     command: '/bin/echo',
     prompt: 'orvia-test',
+    provider: 'openai',
+    model: 'gpt-4.1',
+    apiKey: 'test-key',
     allowedTools: ['read', 'grep'],
     deniedTools: ['bash'],
+    skillPaths: ['/tmp/orvia-skill'],
+    disableDefaultSkills: true,
     onEvent: (event) => {
       events.push(event.type);
       if (event.type === 'stdout' && typeof event.payload === 'string') output.push(event.payload);
@@ -52,5 +57,30 @@ test('PiRuntimeAdapter starts a process and waits for completion', async () => {
   assert.equal(started.status, 'running');
   assert.equal(completed.status, 'completed');
   assert.deepEqual(events, ['started', 'stdout', 'completed']);
+  assert.match(output.join(''), /--provider openai --model gpt-4\.1 --api-key test-key/);
   assert.match(output.join(''), /--tools read,grep --exclude-tools bash/);
+  assert.match(output.join(''), /--no-skills/);
+  assert.match(output.join(''), /--skill \/tmp\/orvia-skill/);
+});
+
+test('redactPiArgs hides api key values', () => {
+  assert.deepEqual(
+    redactPiArgs(['--provider', 'openai', '--api-key', 'sk-secret', '--model', 'gpt']),
+    ['--provider', 'openai', '--api-key', '***', '--model', 'gpt'],
+  );
+});
+
+test('PiRuntimeAdapter refuses partial credentials', async () => {
+  const adapter = new PiRuntimeAdapter();
+  await assert.rejects(
+    () => adapter.start({
+      sessionId: 7002,
+      taskId: 1,
+      command: '/bin/echo',
+      prompt: 'x',
+      provider: 'openai',
+      model: 'gpt-4.1',
+    }),
+    /provider、model 和 apiKey/,
+  );
 });

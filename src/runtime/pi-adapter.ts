@@ -19,8 +19,39 @@ interface ParsedPiOutput {
 function describePiTool(toolName: string): string {
   if (toolName === 'read' || toolName === 'grep' || toolName === 'find' || toolName === 'ls') return '正在查看这个 Agent 的文件…';
   if (toolName === 'edit' || toolName === 'write') return '正在按指导修改这个 Agent 的文件…';
-  if (toolName === 'bash') return '正在这个 Agent 的目录里执行命令…';
+  if (toolName === 'bash' || toolName === 'powershell') return '正在这个 Agent 的目录里执行命令…';
   return '正在处理你的指导…';
+}
+
+/** 显式传了 --api-key 时清掉常见环境变量，避免 Pi 仍走本机默认凭证 */
+const PI_AUTH_ENV_KEYS = [
+  'OPENAI_API_KEY',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'GOOGLE_API_KEY',
+  'GEMINI_API_KEY',
+  'OPENROUTER_API_KEY',
+  'MINIMAX_API_KEY',
+  'MINIMAX_API_TOKEN',
+  'MINIMAX_GROUP_ID',
+  'API_KEY',
+  'PI_API_KEY',
+];
+
+function environmentForPi(input: RuntimeSessionInput): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...input.environment };
+  if (input.apiKey) {
+    for (const key of PI_AUTH_ENV_KEYS) delete env[key];
+  }
+  return env;
+}
+
+export function redactPiArgs(args: string[]): string[] {
+  const next = [...args];
+  for (let index = 0; index < next.length - 1; index += 1) {
+    if (next[index] === '--api-key') next[index + 1] = '***';
+  }
+  return next;
 }
 
 export function parsePiOutputLine(line: string): ParsedPiOutput {
@@ -97,8 +128,13 @@ export class PiRuntimeAdapter implements AgentRuntimeAdapter {
 
     const command = input.command ?? process.env.PI_COMMAND ?? 'pi';
     const args = ['--print', '--mode', 'json', '--no-session'];
-    if (input.provider) args.push('--provider', input.provider);
-    if (input.model) args.push('--model', input.model);
+    // 节点级模型：必须成套传入，避免只传了 model 却仍用 Pi 本机默认 key
+    if (input.provider || input.model || input.apiKey) {
+      if (!input.provider?.trim() || !input.model?.trim() || !input.apiKey?.trim()) {
+        throw new Error('启动 Pi 需要同时提供节点配置的 provider、model 和 apiKey');
+      }
+      args.push('--provider', input.provider.trim(), '--model', input.model.trim(), '--api-key', input.apiKey.trim());
+    }
     if (input.systemPrompt) args.push('--system-prompt', input.systemPrompt);
     if (input.allowedTools) {
       if (input.allowedTools.length === 0) args.push('--no-tools');
@@ -107,11 +143,17 @@ export class PiRuntimeAdapter implements AgentRuntimeAdapter {
     if (input.deniedTools && input.deniedTools.length > 0) {
       args.push('--exclude-tools', input.deniedTools.join(','));
     }
+    if (input.disableDefaultSkills || (input.skillPaths && input.skillPaths.length > 0)) {
+      args.push('--no-skills');
+    }
+    for (const skillPath of input.skillPaths ?? []) {
+      if (skillPath.trim()) args.push('--skill', skillPath.trim());
+    }
     args.push('--', input.prompt ?? 'Continue the assigned Orvia task.');
 
     const child = spawn(command, args, {
       cwd: input.workingDirectory,
-      env: { ...process.env, ...input.environment },
+      env: environmentForPi(input),
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -152,8 +194,11 @@ export class PiRuntimeAdapter implements AgentRuntimeAdapter {
       stdoutBuffer = lines.pop() ?? '';
       for (const line of lines) consumeStdoutLine(line);
     });
+    let stderrText = '';
     child.stderr.on('data', (chunk: Buffer) => {
-      emit({ sessionId: input.sessionId, type: 'stderr', payload: chunk.toString('utf8') });
+      const text = chunk.toString('utf8');
+      stderrText += text;
+      emit({ sessionId: input.sessionId, type: 'stderr', payload: text });
     });
     let spawnError: Error | undefined;
     child.once('error', (error) => { spawnError = error; });
@@ -166,12 +211,19 @@ export class PiRuntimeAdapter implements AgentRuntimeAdapter {
         emit({ sessionId: input.sessionId, type: 'stdout', payload: finalText });
       }
       const status = code === 0 && !spawnError ? 'completed' : 'failed';
+      const stderrHint = stderrText.replace(/\s+/g, ' ').trim().slice(0, 500);
+      const message = status === 'failed'
+        ? (spawnError?.message
+          ?? (signal ? `Pi 进程被信号 ${signal} 终止` : undefined)
+          ?? (stderrHint || undefined)
+          ?? (typeof code === 'number' ? `Pi 进程退出码 ${code}` : 'Pi 执行失败'))
+        : undefined;
       const result = {
         sessionId: input.sessionId,
         status,
         runtime: this.name,
         pid: child.pid,
-        message: spawnError?.message ?? (signal ? `Pi exited with signal ${signal}` : undefined),
+        message,
       } satisfies RuntimeSessionResult;
       this.statuses.set(input.sessionId, status);
       this.results.set(input.sessionId, result);
@@ -182,11 +234,21 @@ export class PiRuntimeAdapter implements AgentRuntimeAdapter {
       emit({
         sessionId: input.sessionId,
         type: status,
-        payload: { code, signal },
+        payload: status === 'failed' ? { code, signal, error: message } : { code, signal },
       });
     });
 
-    emit({ sessionId: input.sessionId, type: 'started', payload: { pid: child.pid, command, args } });
+    emit({
+      sessionId: input.sessionId,
+      type: 'started',
+      payload: {
+        pid: child.pid,
+        command,
+        args: redactPiArgs(args),
+        provider: input.provider ?? null,
+        model: input.model ?? null,
+      },
+    });
     return {
       sessionId: input.sessionId,
       status: 'running',

@@ -86,8 +86,8 @@ console.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', 
       version: 'v1',
       definitionJson: {
         nodes: [
-          { key: 'build', name: 'Build', type: 'task', capability: 'code_generation', prompt: 'Reply ORVIA_WORKFLOW_OK' },
-          { key: 'review', name: 'Review', type: 'checkpoint', capability: 'human_review', question: 'Approve?' },
+          { key: 'build', name: 'Build', type: 'task', capability: 'code_generation', modelId: model.id, prompt: 'Reply ORVIA_WORKFLOW_OK' },
+          { key: 'review', name: 'Review', type: 'checkpoint', question: 'Approve?' },
         ],
         edges: [{ source: 'build', target: 'review' }],
       },

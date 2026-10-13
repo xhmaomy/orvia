@@ -7,9 +7,14 @@ export interface RuntimeSessionInput {
   systemPrompt?: string;
   model?: string;
   provider?: string;
+  /** 传给 Pi `--api-key`。与 provider/model 成套传入时禁止回退到 Pi 本机凭证 */
+  apiKey?: string;
   workingDirectory?: string;
   allowedTools?: string[];
   deniedTools?: string[];
+  /** Pi `--skill` 路径；配合 disableDefaultSkills 只加载 Orvia 勾选的 Skill */
+  skillPaths?: string[];
+  disableDefaultSkills?: boolean;
   command?: string;
   environment?: Record<string, string>;
   onEvent?: (event: RuntimeSessionEvent) => void;

@@ -97,13 +97,24 @@ export class EmbeddedRedis implements RedisRuntime {
 class IoredisRuntime implements RedisRuntime {
   mode = 'redis' as const;
   private healthy = true;
+  private lastErrorLog = 0;
 
   constructor(
     private readonly client: Redis,
     private readonly subscriber: Redis,
   ) {
-    client.on('error', () => { this.healthy = false; });
+    const markDown = (label: string, error: Error) => {
+      this.healthy = false;
+      const now = Date.now();
+      if (now - this.lastErrorLog < 5_000) return;
+      this.lastErrorLog = now;
+      console.error(`Orvia Redis ${label}: ${error.message}`);
+    };
+    client.on('error', (error) => { markDown('client', error); });
     client.on('ready', () => { this.healthy = true; });
+    client.on('end', () => { this.healthy = false; });
+    subscriber.on('error', (error) => { markDown('subscriber', error); });
+    subscriber.on('ready', () => { this.healthy = true; });
   }
 
   status(): 'ok' | 'error' {
@@ -161,6 +172,20 @@ class IoredisRuntime implements RedisRuntime {
   }
 }
 
+function redisClientOptions() {
+  return {
+    lazyConnect: true,
+    // 短时闪断时允许有限重试；长连接靠 retryStrategy 自动恢复
+    maxRetriesPerRequest: 3,
+    connectTimeout: 5_000,
+    enableReadyCheck: true,
+    // 旧配置 retryStrategy: () => null 会在一次断线后永不重连，长跑时容易误报「Redis 无法连接」
+    retryStrategy(times: number) {
+      return Math.min(times * 200, 5_000);
+    },
+  };
+}
+
 export function redisRuntime(): RedisRuntime {
   if (!runtime) throw new Error('Redis is not connected');
   return runtime;
@@ -173,17 +198,13 @@ export function useEmbeddedRedis(): RedisRuntime {
 
 export async function connectRedis(): Promise<RedisRuntime> {
   const url = config.redisUrl;
-  const client = new Redis(url, {
-    lazyConnect: true,
-    maxRetriesPerRequest: 1,
-    connectTimeout: 1500,
-    retryStrategy: () => null,
-  });
+  const options = redisClientOptions();
+  const client = new Redis(url, options);
   client.on('error', () => {});
   try {
     await client.connect();
     await client.ping();
-    const subscriber = client.duplicate();
+    const subscriber = client.duplicate(options);
     subscriber.on('error', () => {});
     await subscriber.connect();
     runtime = new IoredisRuntime(client, subscriber);
