@@ -78,8 +78,6 @@ Orvia 执行节点、校验上游产物、以及侧栏对话时，都在 API 所
 pi --print --mode json --no-session -- <任务提示>
 ```
 
-因此用的是这台机器上 Pi 已经保存的默认模型。控制台里的模型管理只给人查看和记录，不会改掉 Pi 的默认模型。密钥不要写进 Orvia 的数据库或 Git。
-
 先确认命令可用：
 
 ```bash
@@ -98,7 +96,6 @@ pi
 2. 执行 `/model`，选中要使用的模型，按 `Ctrl+S` 存成新会话的默认模型。Orvia 每次都是一次新的调用，只在当前会话里切换模型不会作用到 Orvia。
 3. 需要思考深度时执行 `/thinking`，同样可以用 `Ctrl+S` 保存启动时的级别。
 
-也可以不把密钥写入 `auth.json`，而在启动 `pnpm dev` 之前导出厂商环境变量。Pi 会读取这些变量，例如 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`MINIMAX_API_KEY`，国内 MiniMax 用 `MINIMAX_CN_API_KEY`。变量要出现在启动 API 的那个进程环境里。
 
 Pi 自带目录里没有的接口，写到 `~/.pi/agent/models.json`。下面是一个兼容 OpenAI 接口的例子：
 
