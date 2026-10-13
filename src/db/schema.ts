@@ -99,6 +99,23 @@ export const capabilities = mysqlTable('ov_capabilities', {
   tenantKeyUnique: uniqueIndex('capabilities_tenant_key_unique').on(table.tenantId, table.key),
 }));
 
+export const skills = mysqlTable('ov_skills', {
+  id: int('id').autoincrement().primaryKey(),
+  tenantId: int('tenant_id').notNull().references(() => tenants.id),
+  key: varchar('skill_key', { length: 120 }).notNull(),
+  name: varchar('name', { length: 160 }).notNull(),
+  description: text('description'),
+  kind: mysqlEnum('skill_kind', ['builtin', 'custom']).notNull().default('custom'),
+  toolsJson: json('tools_json'),
+  contentMd: text('content_md'),
+  configJson: json('config_json'),
+  status: status.notNull().default('active'),
+  createdAt: timestamp('created_at').default(sql`CURRENT_TIMESTAMP`).notNull(),
+  updatedAt: timestamp('updated_at').default(sql`CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
+}, (table) => ({
+  tenantKeyUnique: uniqueIndex('skills_tenant_key_unique').on(table.tenantId, table.key),
+}));
+
 export const agents = mysqlTable('ov_agents', {
   id: int('id').autoincrement().primaryKey(),
   projectId: int('project_id').notNull().references(() => projects.id),
@@ -106,6 +123,7 @@ export const agents = mysqlTable('ov_agents', {
   name: varchar('name', { length: 160 }).notNull(),
   description: text('description'),
   capabilitiesJson: json('capabilities_json'),
+  skillsJson: json('skills_json'),
   createdAt: timestamp('created_at').default(sql`CURRENT_TIMESTAMP`).notNull(),
   updatedAt: timestamp('updated_at').default(sql`CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
 }, (table) => ({

@@ -8,22 +8,34 @@ import { WorkflowBoard, graphFromStored, type NodeCheck, type SummaryNode, type 
 
 type Id = number;
 type Project = { id: Id; name: string; description?: string | null; createdAt?: string; workflowCount?: number };
-type Provider = { id: Id; name: string; type: string; baseUrl?: string | null };
+type Provider = { id: Id; name: string; type: string; baseUrl?: string | null; apiKeySet?: boolean; apiKeyMasked?: string };
 type Model = { id: Id; providerId: Id; name: string; displayName: string };
-type Agent = { id: Id; name: string; description?: string; capabilitiesJson?: unknown; workflowId?: number | null };
+type Agent = { id: Id; name: string; description?: string; capabilitiesJson?: unknown; skillsJson?: unknown; workflowId?: number | null };
 type CapabilityRow = { id: Id; key: string; name: string; description?: string | null; tenantId?: Id };
-type WorkflowNodeDraft = { key: string; name: string; type: 'task' | 'checkpoint' | 'start' | 'end'; capabilities: string[]; question: string; instruction: string; outputRequirement: string; acceptanceRule: string; maxRedos: number; requirement: string; x: number; y: number; w: number; h: number };
+type SkillRow = { id: Id; key: string; name: string; description?: string | null; kind?: 'builtin' | 'custom'; toolsJson?: unknown; contentMd?: string | null; configJson?: unknown; tenantId?: Id };
+type WorkflowNodeDraft = { key: string; name: string; type: 'task' | 'checkpoint' | 'start' | 'end'; capabilities: string[]; skills: string[]; modelId: number | null; question: string; instruction: string; outputRequirement: string; acceptanceRule: string; maxRedos: number; requirement: string; x: number; y: number; w: number; h: number };
 type WorkflowLoop = { key: string; nodeKeys: string[]; maxIterations: number };
 type AgentVersion = { id: Id; agentId: Id; modelId: Id; version: string; role: string; mission?: string };
 type Workflow = { id: Id; name: string; version: string; status: string; runStatus?: string | null; definitionJson?: unknown; projectId?: Id; projectName?: string; createdAt?: string; updatedAt?: string };
 type Run = { id: Id; workflowId: Id; status: string; currentPlanVersion?: number; startedAt?: string; completedAt?: string; errorJson?: unknown };
 type EventRow = { id: Id; type: string; payloadJson?: unknown; payload?: unknown; createdAt?: string; occurredAt?: string; workflowRunId?: Id; taskId?: Id | null };
 type Center = { counts: Record<string, number>; recentEvents: EventRow[] };
-type Decision = { id: Id; workflowRunId?: Id; checkpointId?: Id; question: string; status: string; contextJson?: unknown; createdAt?: string };
+type Decision = {
+  id: Id;
+  workflowRunId?: Id;
+  checkpointId?: Id;
+  question: string;
+  decision?: string | null;
+  action?: string | null;
+  status: string;
+  contextJson?: unknown;
+  createdAt?: string;
+  resolvedAt?: string | null;
+};
 type Checkpoint = { id: Id; workflowRunId: Id; title: string; instructions?: string; status: string; contextJson?: unknown };
 type RunDetail = Run & { plans: AnyRow[]; tasks: AnyRow[]; sessions: AnyRow[]; checkpoints: Checkpoint[]; decisions: Decision[]; events: EventRow[] };
 type AnyRow = Record<string, unknown> & { id: Id; status?: string; name?: string };
-type View = 'overview' | 'models' | 'agents' | 'capabilities' | 'workflows' | 'settings';
+type View = 'overview' | 'models' | 'agents' | 'capabilities' | 'skills' | 'workflows' | 'settings';
 type LoadState = 'loading' | 'ready' | 'error';
 type TenantRow = { tenantId: number; name: string; slug?: string; role?: string };
 type SystemSettings = {
@@ -35,7 +47,7 @@ type SystemSettings = {
 
 const API_URL = process.env.NEXT_PUBLIC_ORVIA_API_URL ?? 'http://127.0.0.1:4100';
 const PATHS: Record<View, string> = {
-  overview: '/', models: '/models', agents: '/agents', capabilities: '/capabilities', workflows: '/workflows', settings: '/settings',
+  overview: '/', models: '/models', agents: '/agents', capabilities: '/capabilities', skills: '/skills', workflows: '/workflows', settings: '/settings',
 };
 let apiToken = '';
 let apiTenantId: number | undefined;
@@ -51,7 +63,9 @@ function viewFromPath(pathname: string): View {
 }
 const NAV: { id: View; label: string; icon: string }[] = [
   { id: 'overview', label: 'Overview', icon: '⌂' }, { id: 'models', label: '模型管理', icon: '◎' },
+  { id: 'agents', label: 'Agent', icon: '◉' },
   { id: 'capabilities', label: '能力', icon: '✦' },
+  { id: 'skills', label: 'Skill 管理', icon: '⚡' },
   { id: 'workflows', label: 'Workflow Builder', icon: '◇' },
   { id: 'settings', label: '系统设置', icon: '⚙' },
 ];
@@ -115,6 +129,37 @@ function nodeProgress(tasks: AnyRow[] | undefined): Record<string, string> {
     if (key) progress[key] = task.status;
   }
   return progress;
+}
+function taskFailureReason(output: unknown): string {
+  if (!output || typeof output !== 'object' || Array.isArray(output)) return '';
+  const record = output as Record<string, unknown>;
+  for (const key of ['error', 'message']) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+function nodeFailures(tasks: AnyRow[] | undefined): Record<string, string> {
+  const failures: Record<string, string> = {};
+  for (const task of [...(tasks ?? [])].sort((left, right) => left.id - right.id)) {
+    if (!task.status || task.status === 'cancelled') continue;
+    const input = task.inputJson;
+    const record = input && typeof input === 'object' ? input as Record<string, unknown> : {};
+    const key = typeof record.key === 'string' ? record.key : '';
+    if (!key) continue;
+    if (task.status === 'failed') {
+      const reason = taskFailureReason(task.outputJson);
+      if (reason) failures[key] = reason;
+      else delete failures[key];
+    } else {
+      delete failures[key];
+    }
+  }
+  return failures;
+}
+function sameFailures(left: Record<string, string>, right: Record<string, string>) {
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length && keys.every((key) => left[key] === right[key]);
 }
 function acceptanceEntry(value: unknown): NodeCheck | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -182,6 +227,37 @@ function nodeChecks(tasks: AnyRow[] | undefined, events?: EventRow[]): Record<st
 function taskRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
+/** 人工复核任务上按上游节点保存的历史：checkpointKey -> upstreamKey -> entries */
+function nodeReviewHistories(tasks: AnyRow[] | undefined): Record<string, Record<string, Array<{ action: string; note: string; name: string; at?: string }>>> {
+  const result: Record<string, Record<string, Array<{ action: string; note: string; name: string; at?: string }>>> = {};
+  for (const task of [...(tasks ?? [])].sort((left, right) => left.id - right.id)) {
+    if (task.status === 'cancelled') continue;
+    const input = taskRecord(task.inputJson);
+    if (input.nodeType !== 'checkpoint') continue;
+    const checkpointKey = typeof input.key === 'string' ? input.key : '';
+    if (!checkpointKey) continue;
+    const raw = input.reviewHistoryByNode;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const byUpstream: Record<string, Array<{ action: string; note: string; name: string; at?: string }>> = {};
+    for (const [upstreamKey, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (!Array.isArray(value)) continue;
+      byUpstream[upstreamKey] = value.flatMap((entry) => {
+        const record = entry && typeof entry === 'object' ? entry as Record<string, unknown> : {};
+        const note = typeof record.note === 'string' ? record.note : '';
+        const action = typeof record.action === 'string' ? record.action : '';
+        if (!note && !action) return [];
+        return [{
+          action,
+          note,
+          name: typeof record.name === 'string' ? record.name : upstreamKey,
+          at: typeof record.at === 'string' ? record.at : undefined,
+        }];
+      });
+    }
+    result[checkpointKey] = byUpstream;
+  }
+  return result;
+}
 function nodeDeliverables(tasks: AnyRow[] | undefined): Record<string, string> {
   const paths: Record<string, string> = {};
   for (const task of [...(tasks ?? [])].sort((left, right) => left.id - right.id)) {
@@ -230,16 +306,22 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 function capabilityKeysOf(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }
-function CapabilityPicker({ label, hint, options, selected, onChange }: { label: string; hint: string; options: CapabilityRow[]; selected: string[]; onChange: (next: string[]) => void }) {
+function CatalogPicker({ label, hint, emptyLabel, options, selected, onChange }: { label: string; hint: string; emptyLabel: string; options: { key: string; name: string; description?: string | null }[]; selected: string[]; onChange: (next: string[]) => void }) {
   const chosen = selected.map((key) => options.find((item) => item.key.toLowerCase() === key.toLowerCase()) ?? { key, name: key, description: null });
   const remaining = options.filter((item) => !selected.some((key) => key.toLowerCase() === item.key));
   return <div className="capability-picker">
     <label>{label}<select value="" onChange={(event) => { const key = event.target.value; if (key) onChange([...selected, key]); }}>
-      <option value="">{options.length ? (remaining.length ? '请选择能力' : '目录里的能力都已选上') : '请先选择项目'}</option>
+      <option value="">{options.length ? (remaining.length ? emptyLabel : '目录项都已选上') : '目录还是空的'}</option>
       {remaining.map((item) => <option value={item.key} key={item.key}>{item.name} · {item.key}</option>)}
     </select><small className="field-hint">{hint}</small></label>
     {chosen.length ? <div className="picked-list">{chosen.map((item) => <div className="picked-item" key={item.key}><span>{item.name}</span><small>{item.key}</small><button type="button" onClick={() => onChange(selected.filter((key) => key.toLowerCase() !== item.key.toLowerCase()))}>移除</button></div>)}</div> : null}
   </div>;
+}
+function CapabilityPicker({ label, hint, options, selected, onChange }: { label: string; hint: string; options: CapabilityRow[]; selected: string[]; onChange: (next: string[]) => void }) {
+  return <CatalogPicker label={label} hint={hint} emptyLabel="请选择能力" options={options} selected={selected} onChange={onChange} />;
+}
+function SkillPicker({ label, hint, options, selected, onChange }: { label: string; hint: string; options: SkillRow[]; selected: string[]; onChange: (next: string[]) => void }) {
+  return <CatalogPicker label={label} hint={hint} emptyLabel="请选择 Skill" options={options} selected={selected} onChange={onChange} />;
 }
 function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
   const closeRef = useRef(onClose);
@@ -269,6 +351,7 @@ export default function ControlCenter() {
   const [models, setModels] = useState<Model[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [capabilities, setCapabilities] = useState<CapabilityRow[]>([]);
+  const [skills, setSkills] = useState<SkillRow[]>([]);
   const [versions, setVersions] = useState<AgentVersion[]>([]);
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [workflowId, setWorkflowId] = useState<Id | null>(null);
@@ -276,6 +359,7 @@ export default function ControlCenter() {
   const [runId, setRunId] = useState<Id | null>(null);
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
   const [liveProgress, setLiveProgress] = useState<Record<string, string> | null>(null);
+  const [liveFailures, setLiveFailures] = useState<Record<string, string> | null>(null);
   const [liveChecks, setLiveChecks] = useState<Record<string, NodeCheck> | null>(null);
   const [liveDeliverables, setLiveDeliverables] = useState<Record<string, string> | null>(null);
   const [center, setCenter] = useState<Center | null>(null);
@@ -297,12 +381,12 @@ export default function ControlCenter() {
 
   const [providerChoice, setProviderChoice] = useState('');
   const [projectName, setProjectName] = useState('');
-  const [agentForm, setAgentForm] = useState({ name: '', capabilities: [] as string[], providerId: '', modelId: '', version: 'v1', role: '', mission: '' });
+  const [agentForm, setAgentForm] = useState({ name: '', capabilities: [] as string[], skills: [] as string[], providerId: '', modelId: '', version: 'v1', role: '', mission: '' });
   const [versionForm, setVersionForm] = useState({ agentId: '', providerId: '', modelId: '', version: 'v1', role: '', mission: '' });
-  const [catalogForm, setCatalogForm] = useState({ providerName: '', providerType: 'openai', baseUrl: '', modelName: '', displayName: '' });
+  const [catalogForm, setCatalogForm] = useState({ providerName: '', providerType: 'openai', baseUrl: '', apiKey: '', modelName: '', displayName: '' });
   const [modelDraft, setModelDraft] = useState<{ id: Id; providerId: string; name: string; displayName: string; baseUrl: string } | null>(null);
-  const [providerDraft, setProviderDraft] = useState<{ id: Id; name: string; type: string; baseUrl: string } | null>(null);
-  const [agentDraft, setAgentDraft] = useState<{ id: Id; versionId: Id | null; name: string; capabilities: string[]; providerId: string; modelId: string; version: string; role: string; mission: string } | null>(null);
+  const [providerDraft, setProviderDraft] = useState<{ id: Id; name: string; type: string; baseUrl: string; apiKey: string; apiKeySet: boolean; apiKeyMasked: string } | null>(null);
+  const [agentDraft, setAgentDraft] = useState<{ id: Id; versionId: Id | null; name: string; capabilities: string[]; skills: string[]; providerId: string; modelId: string; version: string; role: string; mission: string } | null>(null);
   const [createDialog, setCreateDialog] = useState<'provider' | 'model' | 'agent' | 'version' | 'project' | 'workflow' | null>(null);
   const [projectDraft, setProjectDraft] = useState<{ id: Id; name: string } | null>(null);
   const [newWorkflowProjectId, setNewWorkflowProjectId] = useState('');
@@ -320,6 +404,11 @@ export default function ControlCenter() {
   const [capabilityForm, setCapabilityForm] = useState({ key: '', name: '', description: '' });
   const [capabilityDraft, setCapabilityDraft] = useState<{ id: Id; key: string; name: string; description: string } | null>(null);
   const [capabilityDialog, setCapabilityDialog] = useState(false);
+  const [skillForm, setSkillForm] = useState({ key: '', name: '', description: '', contentMd: '', toolsAllow: 'bash', source: 'markdown' as 'markdown' | 'upload' });
+  const [skillUpload, setSkillUpload] = useState<File | null>(null);
+  const [skillDraft, setSkillDraft] = useState<{ id: Id; key: string; name: string; description: string; kind: 'builtin' | 'custom'; contentMd: string; toolsAllow: string; files: string[]; source?: string } | null>(null);
+  const [skillDraftUpload, setSkillDraftUpload] = useState<File | null>(null);
+  const [skillDialog, setSkillDialog] = useState(false);
   const [replanReason, setReplanReason] = useState('');
   const [replanJson, setReplanJson] = useState('');
   const [decisionText, setDecisionText] = useState<Record<number, string>>({});
@@ -346,13 +435,14 @@ export default function ControlCenter() {
   }, []);
 
   const loadGlobal = useCallback(async () => {
-    const [projectRows, providerRows, modelRows, versionRows, workflowRows, capabilityRows] = await Promise.all([
+    const [projectRows, providerRows, modelRows, versionRows, workflowRows, capabilityRows, skillRows] = await Promise.all([
       list<Project>('/api/projects'),
       list<Provider>('/api/model-providers'),
       list<Model>('/api/models'),
       list<AgentVersion>('/api/agent-versions'),
       list<Workflow>('/api/workflows'),
       list<CapabilityRow>('/api/capabilities'),
+      list<SkillRow>('/api/skills'),
     ]);
     setProjects(projectRows);
     setProviders(providerRows);
@@ -360,22 +450,25 @@ export default function ControlCenter() {
     setVersions(versionRows);
     setWorkflows(workflowRows);
     setCapabilities(capabilityRows);
+    setSkills(skillRows);
   }, []);
 
   const loadProject = useCallback(async (id: Id) => {
     setState('loading'); setError('');
     try {
-      const [agentRows, dashboard, decisionRows, workflowRows, capabilityRows] = await Promise.all([
+      const [agentRows, dashboard, decisionRows, workflowRows, capabilityRows, skillRows] = await Promise.all([
         list<Agent>(`/api/agents?projectId=${id}`),
         request<Center>(`/api/control-center?projectId=${id}`),
         list<Decision>(`/api/decisions?projectId=${id}`),
         list<Workflow>('/api/workflows'),
         list<CapabilityRow>('/api/capabilities'),
+        list<SkillRow>('/api/skills'),
       ]);
       setAgents(agentRows);
       setCenter(dashboard);
       setDecisions(decisionRows);
       setWorkflows(workflowRows);
+      setSkills(skillRows);
       setCapabilities(capabilityRows);
       setWorkflowId((current) => current && workflowRows.some((item) => item.id === current) ? current : null);
       setState('ready');
@@ -394,6 +487,12 @@ export default function ControlCenter() {
       const result = await request<{ data: RunDetail }>(`/api/workflow-runs/${id}`);
       setRunDetail(result.data);
       setWorkflows((current) => current.map((item) => item.id === result.data.workflowId ? { ...item, runStatus: result.data.status } : item));
+      // 面板上的「待确认」来自 decisions 列表；Run 详情刷新时同步，否则等人工复核时入口出不来
+      const runDecisions = result.data.decisions ?? [];
+      setDecisions((current) => {
+        const others = current.filter((item) => item.workflowRunId !== id);
+        return [...others, ...runDecisions];
+      });
     } catch (cause) { fail(cause, '运行详情加载失败'); }
   }, [fail]);
   const loadSystemSettings = useCallback(async () => {
@@ -499,7 +598,7 @@ export default function ControlCenter() {
   useAutoDismiss(error, setError);
   useAutoDismiss(notice, setNotice);
   useAutoDismiss(chatError, setChatError);
-  useEffect(() => { setLiveProgress(null); setLiveChecks(null); setLiveDeliverables(null); progressSync.current = false; progressFloor.current = null; }, [runId]);
+  useEffect(() => { setLiveProgress(null); setLiveFailures(null); setLiveChecks(null); setLiveDeliverables(null); progressSync.current = false; progressFloor.current = null; }, [runId]);
   useEffect(() => {
     boardOpen.current = board !== null;
     if (!board || !runId) return;
@@ -511,6 +610,7 @@ export default function ControlCenter() {
         const floor = progressFloor.current;
         if (floor != null && !tasks.some((task) => task.id > floor)) {
           setLiveProgress({});
+          setLiveFailures({});
           setLiveChecks({});
           setLiveDeliverables({});
           return;
@@ -520,6 +620,11 @@ export default function ControlCenter() {
         setLiveProgress((current) => {
           const baseline = current ?? nodeProgress(runDetail?.tasks);
           return sameProgress(baseline, next) ? current : next;
+        });
+        const failures = nodeFailures(tasks);
+        setLiveFailures((current) => {
+          const baseline = current ?? nodeFailures(runDetail?.tasks);
+          return sameFailures(baseline, failures) ? current : failures;
         });
         const eventRows = [...(runDetail?.events ?? []), ...liveEvents.filter((event) => event.workflowRunId === runId)];
         const checks = nodeChecks(tasks, eventRows);
@@ -533,13 +638,20 @@ export default function ControlCenter() {
           return sameDeliverables(baseline, deliverables) ? current : deliverables;
         });
         const values = Object.values(next);
-        const busy = values.some((status) => status === 'running' || status === 'pending' || status === 'paused');
+        const anyRunning = values.some((status) => status === 'running');
+        const anyFailed = values.some((status) => status === 'failed');
+        // 已有失败节点时，剩下的 pending/blocked 不能把整次 Run 伪装成「运行中」，否则失败后要点停止才能再执行
+        const busy = anyRunning || (!anyFailed && values.some((status) => status === 'pending' || status === 'paused'));
         if (busy) {
           progressSync.current = false;
-          setRunDetail((current) => current && current.status !== 'running' ? { ...current, status: 'running' } : current);
+          setRunDetail((current) => {
+            if (!current) return current;
+            if (['failed', 'completed', 'cancelled'].includes(current.status) && !anyRunning) return current;
+            return current.status !== 'running' ? { ...current, status: 'running' } : current;
+          });
           return;
         }
-        const settled = values.some((status) => status === 'failed' || status === 'awaiting_decision') || !values.some((status) => status === 'blocked');
+        const settled = anyFailed || values.some((status) => status === 'awaiting_decision') || !values.some((status) => status === 'blocked');
         if (settled && !progressSync.current) {
           progressSync.current = true;
           void loadRun(runId);
@@ -558,7 +670,12 @@ export default function ControlCenter() {
     const remember = (event: EventRow) => {
       // 流式执行日志只在内存/Redis，不落库；窗口加大以免长跑时面板日志被冲掉
       setLiveEvents((current) => current.some((item) => item.id === event.id) ? current : [event, ...current].slice(0, 2000));
-      const runEnded = event.type === 'workflow.completed' || event.type === 'workflow.stopped' || event.type === 'checkpoint.pending';
+      const runEnded = event.type === 'workflow.completed'
+        || event.type === 'workflow.failed'
+        || event.type === 'workflow.stopped'
+        || event.type === 'checkpoint.pending'
+        || event.type === 'acceptance.pending'
+        || event.type === 'task.failed';
       if (runId && event.workflowRunId === runId && (!boardOpen.current || runEnded)) void loadRun(runId);
     };
     const source = new EventSource(`${API_URL}/api/events/stream?projectId=${projectId}${tokenQuery}`);
@@ -627,14 +744,17 @@ export default function ControlCenter() {
       if (!catalogForm.providerName.trim() || !catalogForm.providerType.trim()) throw new Error('请输入 Provider 名称与类型');
       const baseUrl = catalogForm.baseUrl.trim();
       if (baseUrl && !/^https?:\/\//i.test(baseUrl)) throw new Error('API 访问地址需要以 http:// 或 https:// 开头');
+      const apiKey = catalogForm.apiKey.trim();
+      if (!apiKey) throw new Error('请填写 API Key，执行时会传给 Pi');
       const created = await request<{ id: Id }>('/api/model-providers', {
         name: catalogForm.providerName.trim(),
         type: catalogForm.providerType.trim(),
         baseUrl: catalogForm.baseUrl.trim() || undefined,
+        apiKey,
       });
       await loadGlobal();
       setProviderChoice(String(created.id));
-      setCatalogForm((value) => ({ ...value, providerName: '', providerType: 'openai', baseUrl }));
+      setCatalogForm((value) => ({ ...value, providerName: '', providerType: 'openai', baseUrl, apiKey: '' }));
       setCreateDialog(null);
     }, 'Provider 已创建并选中');
   }
@@ -646,7 +766,14 @@ export default function ControlCenter() {
       if (!draft.name.trim() || !draft.type.trim()) throw new Error('请输入 Provider 名称与类型');
       const baseUrl = draft.baseUrl.trim();
       if (baseUrl && !/^https?:\/\//i.test(baseUrl)) throw new Error('API 访问地址需要以 http:// 或 https:// 开头');
-      await request(`/api/model-providers/${draft.id}`, { name: draft.name.trim(), type: draft.type.trim(), baseUrl }, 'PATCH');
+      const nextKey = draft.apiKey.trim();
+      if (!draft.apiKeySet && !nextKey) throw new Error('请填写 API Key，执行时会传给 Pi');
+      await request(`/api/model-providers/${draft.id}`, {
+        name: draft.name.trim(),
+        type: draft.type.trim(),
+        baseUrl,
+        ...(nextKey ? { apiKey: nextKey } : {}),
+      }, 'PATCH');
       setProviderDraft(null);
       await loadGlobal();
     }, 'Provider 已更新');
@@ -737,15 +864,15 @@ export default function ControlCenter() {
     if (!model || model.providerId !== provider.id) throw new Error('所选 Model 不属于所选 Provider');
     return model;
   }
-  async function createAgentFrom(form: { name: string; capabilities: string[]; providerId: string; modelId: string; version: string; role: string; mission: string }) {
+  async function createAgentFrom(form: { name: string; capabilities: string[]; skills: string[]; providerId: string; modelId: string; version: string; role: string; mission: string }) {
     return act('agent', async () => {
       const id = requireProject();
       if (!form.name.trim()) throw new Error('请输入 Agent 名称');
       const model = requireCatalogModel(form.providerId, form.modelId);
-      const created = await request<{ id: Id }>('/api/agents', { projectId: id, name: form.name.trim(), capabilitiesJson: form.capabilities });
+      const created = await request<{ id: Id }>('/api/agents', { projectId: id, name: form.name.trim(), capabilitiesJson: form.capabilities, skillsJson: form.skills });
       await request('/api/agent-versions', { agentId: created.id, modelId: model.id, version: form.version.trim() || 'v1', role: form.role.trim() || form.name.trim(), mission: form.mission.trim() || undefined });
       await loadGlobal(); await loadProject(id);
-      setAgentForm((value) => ({ ...value, name: '', capabilities: [], role: '', mission: '' }));
+      setAgentForm((value) => ({ ...value, name: '', capabilities: [], skills: [], role: '', mission: '' }));
       setCreateDialog(null);
     }, 'Agent 已创建，并绑定了所选 Provider 的 Model');
   }
@@ -764,13 +891,13 @@ export default function ControlCenter() {
       setCreateDialog(null);
     }, 'Agent Version 已绑定');
   }
-  async function saveAgentFrom(draft: { id: Id; versionId: Id | null; name: string; capabilities: string[]; providerId: string; modelId: string; version: string; role: string; mission: string }) {
+  async function saveAgentFrom(draft: { id: Id; versionId: Id | null; name: string; capabilities: string[]; skills: string[]; providerId: string; modelId: string; version: string; role: string; mission: string }) {
     return act('agent-edit', async () => {
       if (!draft.name.trim()) throw new Error('请输入 Agent 名称');
       const model = requireCatalogModel(draft.providerId, draft.modelId);
       if (!draft.version.trim()) throw new Error('请填写版本号');
       if (!draft.role.trim()) throw new Error('请填写角色');
-      await request(`/api/agents/${draft.id}`, { name: draft.name.trim(), capabilitiesJson: draft.capabilities }, 'PATCH');
+      await request(`/api/agents/${draft.id}`, { name: draft.name.trim(), capabilitiesJson: draft.capabilities, skillsJson: draft.skills }, 'PATCH');
       if (draft.versionId) {
         await request(`/api/agent-versions/${draft.versionId}`, { modelId: model.id, version: draft.version.trim(), role: draft.role.trim(), mission: draft.mission.trim() }, 'PATCH');
       } else {
@@ -810,23 +937,130 @@ export default function ControlCenter() {
   function capabilityName(key: string) {
     return capabilities.find((item) => item.key === key.toLowerCase())?.name ?? key;
   }
+  function skillName(key: string) {
+    return skills.find((item) => item.key === key.toLowerCase())?.name ?? key;
+  }
+  function toolsAllowText(value: unknown): string {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+    const allow = (value as { allow?: unknown }).allow;
+    return Array.isArray(allow) ? allow.filter((item): item is string => typeof item === 'string').join(', ') : '';
+  }
+  function skillPackageMeta(value: unknown): { source?: string; files: string[] } {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return { files: [] };
+    const record = value as { source?: unknown; files?: unknown };
+    const files = Array.isArray(record.files) ? record.files.filter((item): item is string => typeof item === 'string') : [];
+    return { source: typeof record.source === 'string' ? record.source : undefined, files };
+  }
+  async function uploadSkillPackage(path: string, file: File, meta: { key: string; name: string; description: string; toolsAllow: string }) {
+    const response = await fetch(`${API_URL}${path}`, {
+      method: 'POST',
+      headers: {
+        ...authHeaders(),
+        'content-type': file.type || 'application/octet-stream',
+        'x-orvia-filename': encodeURIComponent(file.name),
+        'x-orvia-skill-key': meta.key,
+        'x-orvia-skill-name': encodeURIComponent(meta.name),
+        'x-orvia-skill-description': encodeURIComponent(meta.description),
+        'x-orvia-skill-tools': meta.toolsAllow,
+      },
+      body: file,
+    });
+    if (!response.ok) {
+      let message = `${response.status} ${response.statusText}`;
+      try { const data = await response.json() as { error?: string }; message = data.error ?? message; } catch { /* keep */ }
+      throw new Error(message);
+    }
+    return response.json();
+  }
+  async function createSkill(e: FormEvent) {
+    e.preventDefault();
+    await act('skill', async () => {
+      if (!skillForm.key.trim()) throw new Error('请填写 Skill 标识');
+      const toolsAllow = skillForm.toolsAllow.split(/[,，\s]+/).map((item) => item.trim()).filter(Boolean).join(',');
+      if (skillForm.source === 'upload') {
+        if (!skillUpload) throw new Error('请选择要导入的 Skill 包（.zip）或 SKILL.md 文件');
+        await uploadSkillPackage('/api/skills/import', skillUpload, {
+          key: skillForm.key.trim(),
+          name: skillForm.name.trim() || skillForm.key.trim(),
+          description: skillForm.description.trim(),
+          toolsAllow: toolsAllow || 'bash',
+        });
+      } else {
+        if (!skillForm.name.trim()) throw new Error('请填写中文名称');
+        if (!skillForm.contentMd.trim()) throw new Error('请填写 SKILL.md 内容，或改为导入 Skill 包');
+        await request('/api/skills', {
+          key: skillForm.key.trim(),
+          name: skillForm.name.trim(),
+          description: skillForm.description.trim(),
+          contentMd: skillForm.contentMd.trim(),
+          toolsJson: { allow: toolsAllow ? toolsAllow.split(',') : ['bash'] },
+        });
+      }
+      await loadGlobal();
+      setSkillForm({ key: '', name: '', description: '', contentMd: '', toolsAllow: 'bash', source: 'markdown' });
+      setSkillUpload(null);
+      setSkillDialog(false);
+    }, '自定义 Skill 已加入目录');
+  }
+  async function saveSkill(e: FormEvent) {
+    e.preventDefault();
+    if (!skillDraft) return;
+    const draft = skillDraft;
+    await act('skill-edit', async () => {
+      if (draft.kind === 'builtin') {
+        await request(`/api/skills/${draft.id}`, { description: draft.description.trim() }, 'PATCH');
+      } else {
+        if (!draft.name.trim()) throw new Error('请填写中文名称');
+        if (skillDraftUpload) {
+          await uploadSkillPackage(`/api/skills/${draft.id}/import`, skillDraftUpload, {
+            key: draft.key,
+            name: draft.name.trim(),
+            description: draft.description.trim(),
+            toolsAllow: draft.toolsAllow || 'bash',
+          });
+        }
+        const toolsAllow = draft.toolsAllow.split(/[,，\s]+/).map((item) => item.trim()).filter(Boolean);
+        await request(`/api/skills/${draft.id}`, {
+          name: draft.name.trim(),
+          description: draft.description.trim(),
+          contentMd: draft.contentMd,
+          toolsJson: { allow: toolsAllow },
+        }, 'PATCH');
+      }
+      await loadGlobal();
+      setSkillDraft(null);
+      setSkillDraftUpload(null);
+    }, 'Skill 已更新');
+  }
+  async function deleteSkill(id: Id) {
+    const item = skills.find((skill) => skill.id === id);
+    if (!item || item.kind === 'builtin') throw new Error('系统内置 Skill 不能删除');
+    const confirmed = window.confirm(`删除自定义 Skill「${item.name}」？\n\n删除后无法恢复。`);
+    if (!confirmed) return;
+    await act('skill-delete', async () => {
+      await request(`/api/skills/${id}`, undefined, 'DELETE');
+      await loadGlobal();
+    }, '自定义 Skill 已删除');
+  }
   function workflowDefinition(nextNodes = workflowNodesForm, nextEdges = workflowEdgesForm, nextLoops = workflowLoops) {
     return {
       nodes: nextNodes.map((node) => ({
         key: node.key,
         name: node.name.trim(),
         type: node.type,
-        capabilities: node.type === 'start' || node.type === 'end' ? [] : node.capabilities,
-        capability: node.capabilities[0] ?? '',
+        capabilities: node.type === 'task' ? node.capabilities : [],
+        capability: node.type === 'task' ? (node.capabilities[0] ?? '') : '',
+        skills: node.type === 'task' ? (node.skills ?? []) : [],
+        ...(node.type === 'task' && node.modelId ? { modelId: node.modelId } : {}),
         x: node.x,
         y: node.y,
         w: node.w,
         h: node.h,
-        ...(node.instruction.trim() ? { instruction: node.instruction.trim() } : {}),
-        ...(node.type !== 'start' && node.type !== 'end' && node.outputRequirement.trim() ? { outputRequirement: node.outputRequirement.trim() } : {}),
+        ...(node.type === 'task' && node.instruction.trim() ? { instruction: node.instruction.trim() } : {}),
+        ...(node.type === 'task' && node.outputRequirement.trim() ? { outputRequirement: node.outputRequirement.trim() } : {}),
         ...(node.type === 'task' && node.acceptanceRule.trim() ? { acceptanceRule: node.acceptanceRule.trim(), maxRedos: node.maxRedos >= 1 ? node.maxRedos : 3 } : {}),
         ...(node.type === 'start' ? { requirement: node.requirement } : {}),
-        ...(node.type === 'checkpoint' && node.question.trim() ? { question: node.question.trim() } : {}),
+        ...(node.type === 'checkpoint' && node.question.trim() && !/^Approve checkpoint:/i.test(node.question.trim()) ? { question: node.question.trim() } : {}),
       })),
       edges: nextEdges.filter((edge) => edge.source && edge.target),
       loops: nextLoops,
@@ -880,7 +1114,11 @@ export default function ControlCenter() {
       if (!workflowNodesForm.some((node) => node.type === 'task')) throw new Error('请至少添加一个 Agent 节点');
       for (const node of workflowNodesForm) {
         if (!node.name.trim()) throw new Error('请填写每个名称');
-        if (node.type !== 'start' && node.type !== 'end' && !node.capabilities.length) throw new Error(`请为 Agent「${node.name.trim() || '未命名 Agent'}」选择能力`);
+        if (node.type === 'task' && !node.capabilities.length) throw new Error(`请为 Agent「${node.name.trim() || '未命名 Agent'}」选择能力`);
+        if (node.type === 'task' && !node.modelId) throw new Error(`请为 Agent「${node.name.trim() || '未命名 Agent'}」选择模型`);
+        if (node.type === 'task' && node.modelId && !models.some((item) => item.id === node.modelId)) {
+          throw new Error(`Agent「${node.name.trim() || '未命名 Agent'}」所选模型不可用，请到「模型管理」检查后再选`);
+        }
       }
       const published = await request<{ version: string; versionId: number }>(`/api/workflows/${workflowId}/publish`, {
         name: workflowForm.name.trim(),
@@ -1034,6 +1272,7 @@ export default function ControlCenter() {
     if (runId) return runId;
     if (!workflowId) throw new Error('请先打开一个 Workflow');
     const created = await request<{ id: Id; status?: string }>('/api/workflow-runs', { workflowId });
+    // 复用已有 Run 时，失败/完成/已停止都可以直接再执行；只有真正运行中才需要先停
     if (created.status === 'running') throw new Error('当前 Run 正在运行，请先停止后再执行');
     await loadRuns(workflowId);
     setRunId(created.id);
@@ -1091,11 +1330,12 @@ export default function ControlCenter() {
           const existing = known.length ? known : await list<AnyRow>(`/api/tasks?workflowRunId=${id}`);
           progressFloor.current = existing.reduce((max, task) => Math.max(max, task.id), 0);
           setLiveProgress({});
+          setLiveFailures({});
           setLiveChecks({});
           setLiveDeliverables({});
           progressSync.current = false;
-          // 从头开始：立刻清掉面板上的旧决策、校验结果和说明，避免仍显示「待确认」
-          setDecisions((rows) => rows.map((item) => item.workflowRunId === id && item.status === 'pending'
+          // 从头开始：立刻清掉本 Run 全部复核/决策状态，避免人工节点仍显示待确认或旧结果
+          setDecisions((rows) => rows.map((item) => item.workflowRunId === id && item.status !== 'superseded'
             ? { ...item, status: 'superseded' }
             : item));
           setDecisionText({});
@@ -1103,7 +1343,8 @@ export default function ControlCenter() {
             ...current,
             status: 'running',
             tasks: (current.tasks ?? []).map((task) => ({ ...task, status: 'cancelled' })),
-            decisions: (current.decisions ?? []).map((item) => item.status === 'pending' ? { ...item, status: 'superseded' } : item),
+            checkpoints: (current.checkpoints ?? []).map((item) => item.status !== 'superseded' ? { ...item, status: 'superseded' } : item),
+            decisions: (current.decisions ?? []).map((item) => item.status !== 'superseded' ? { ...item, status: 'superseded' } : item),
           } : current);
         }
         try {
@@ -1112,6 +1353,7 @@ export default function ControlCenter() {
           if (mode === 'restart') {
             progressFloor.current = null;
             setLiveProgress(null);
+            setLiveFailures(null);
             setLiveChecks(null);
             setLiveDeliverables(null);
           }
@@ -1119,8 +1361,12 @@ export default function ControlCenter() {
         }
         setRunDetail((current) => current ? { ...current, status: 'running' } : current);
         if (mode === 'restart' && projectId) {
-          await loadProject(projectId);
+          // 后端已同步作废旧复核；再拉一次，确保进度/决策与库一致
           await loadRun(id);
+          await loadProject(projectId);
+          setLiveProgress({});
+          setLiveFailures({});
+          setLiveChecks({});
         }
         return;
       }
@@ -1147,27 +1393,72 @@ export default function ControlCenter() {
       return false;
     }
   }
-  async function resolveDecision(id: Id, action: 'approve' | 'request_changes' | 'reject' | 'override' | 'replan' | 'repeat') {
+  async function stopNodeChat() {
+    if (!workflowId || !chatNodeKey) return;
+    setChatError('');
+    try {
+      await request(`/api/workflows/${workflowId}/nodes/${encodeURIComponent(chatNodeKey)}/messages/stop`, {});
+      setChatTick((value) => value + 1);
+    } catch (cause) {
+      setChatError(cause instanceof Error ? cause.message : '打断失败');
+    }
+  }
+  async function resolveDecision(
+    id: Id,
+    action: 'approve' | 'return' | 'reject',
+    options?: {
+      decision?: string;
+      reviews?: Array<{ key: string; name: string; note: string; action?: string }>;
+      targetKey?: string;
+    },
+  ) {
     await act(`decision-${id}`, async () => {
-      const decision = decisionText[id]?.trim();
-      if (!decision) throw new Error('请填写决策说明');
       const current = decisions.find((item) => item.id === id);
       const context = current?.contextJson && typeof current.contextJson === 'object' ? current.contextJson as Record<string, unknown> : {};
       const acceptance = context.kind === 'acceptance';
+      const reviews = options?.reviews?.filter((item) => item.key && item.note.trim()) ?? [];
+      const typed = (options?.decision ?? decisionText[id] ?? '').trim()
+        || reviews.map((item) => `【${item.name || item.key}】${item.note.trim()}`).join('\n');
+      // 不合格待确认：系统已有判定原因；批准继续可不填，退回默认用原判定说明
+      const acceptanceFallback = acceptance
+        ? (typeof current?.question === 'string' && current.question.trim()
+          ? current.question.trim()
+          : action === 'approve' ? '人工批准：同意继续。' : action === 'return' ? '按原判定退回重做。' : '人工拒绝。')
+        : '';
+      const decision = typed
+        || acceptanceFallback
+        || (action === 'approve' && !acceptance ? '批准' : '');
+      if (!acceptance && action === 'return' && decision.length < 2) throw new Error('退回时请写清楚哪里有问题、怎么改');
+      if (action === 'return' && !acceptance && reviews.length === 0) throw new Error('请选择要退回的上游节点并填写说明');
+      if (!acceptance && action === 'reject' && decision.length < 2) throw new Error('拒绝时请填写说明');
+      if (!acceptance && action === 'approve' && !decision) throw new Error('批准失败，请重试');
       const nodeKey = typeof context.checkerKey === 'string' ? context.checkerKey : typeof context.key === 'string' ? context.key : '';
-      // 先清掉面板上的「待确认」，再等服务端续跑；验收乐观更新只动 checker，不影响普通人工复核
-      setDecisions((rows) => rows.map((item) => item.id === id ? { ...item, status: action === 'approve' || action === 'override' ? 'approved' : action === 'reject' ? 'rejected' : 'changes_requested' } : item));
+      // 先清掉面板上的「待确认」，并把说明写入本地历史，再等服务端续跑
+      setDecisions((rows) => rows.map((item) => item.id === id ? {
+        ...item,
+        decision,
+        action: action === 'return' ? 'request_changes' : action,
+        status: action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : 'changes_requested',
+        resolvedAt: new Date().toISOString(),
+        contextJson: {
+          ...context,
+          ...(reviews.length ? { reviews } : {}),
+          ...(options?.targetKey ? { targetKey: options.targetKey } : {}),
+        },
+      } : item));
       if (nodeKey) {
         setLiveProgress((value) => {
           const next = { ...(value ?? nodeProgress(runDetail?.tasks)) };
-          if (next[nodeKey] === 'awaiting_decision') next[nodeKey] = action === 'reject' ? 'failed' : 'pending';
+          if (next[nodeKey] === 'awaiting_decision') {
+            next[nodeKey] = action === 'reject' ? 'failed' : action === 'return' ? 'blocked' : 'pending';
+          }
           return next;
         });
       }
       if (acceptance && nodeKey) {
         setLiveChecks((value) => {
           const next = { ...(value ?? nodeChecks(runDetail?.tasks, runDetail?.events)) };
-          if (action === 'approve' || action === 'override') {
+          if (action === 'approve') {
             const previous = next[nodeKey];
             const history = [...(previous?.history ?? [])];
             if (previous?.verdict === 'reject') history.push({ verdict: previous.verdict, label: previous.label, detail: previous.detail, at: previous.at });
@@ -1176,12 +1467,17 @@ export default function ControlCenter() {
           return next;
         });
       }
-      await request(`/api/decisions/${id}/resolve`, { decision, action });
+      await request(`/api/decisions/${id}/resolve`, {
+        decision,
+        action,
+        ...(reviews.length ? { reviews } : {}),
+      });
       await loadProject(requireProject());
       if (runId) await loadRun(runId);
       setLiveChecks(null);
       setLiveProgress(null);
-    }, action === 'repeat' ? '将再做一次这一段' : action === 'request_changes' || action === 'replan' ? '决策已提交，新 Plan 将自动继续' : '决策已提交');
+      setLiveFailures(null);
+    }, action === 'approve' ? '已批准，继续执行' : action === 'return' ? '已退回指定上游，说明已交给对应 Agent' : '已拒绝，流程停止');
   }
 
   const overview = <div className="view-stack">
@@ -1212,8 +1508,8 @@ export default function ControlCenter() {
   </div>;
 
   const modelsView = <div className="view-stack">
-    <SectionTitle title="模型管理" action={<div className="run-controls"><button type="button" onClick={() => { setCatalogForm((value) => ({ ...value, providerName: '', providerType: 'openai', baseUrl: '' })); setCreateDialog('provider'); }}>创建 Provider</button><button type="button" onClick={openCreateModel}>创建模型</button></div>} />
-    <section className="panel"><h3>已有 Provider</h3>{providers.length ? providers.map((item) => <div className="data-row" key={item.id}><span>#{item.id} {item.name}</span><small>{item.type} · {item.baseUrl || '未填写 API 地址'}</small><button type="button" onClick={() => setProviderDraft({ id: item.id, name: item.name, type: item.type, baseUrl: item.baseUrl ?? '' })}>编辑</button></div>) : <Empty>还没有 Provider。点击右上角「创建 Provider」添加。</Empty>}</section>
+    <SectionTitle title="模型管理" action={<div className="run-controls"><button type="button" onClick={() => { setCatalogForm((value) => ({ ...value, providerName: '', providerType: 'openai', baseUrl: '', apiKey: '' })); setCreateDialog('provider'); }}>创建 Provider</button><button type="button" onClick={openCreateModel}>创建模型</button></div>} />
+    <section className="panel"><h3>已有 Provider</h3>{providers.length ? providers.map((item) => <div className="data-row" key={item.id}><span>#{item.id} {item.name}</span><small>{item.type} · {item.baseUrl || '未填写 API 地址'} · {item.apiKeySet ? `API Key ${item.apiKeyMasked || '已配置'}` : '未配置 API Key'}</small><button type="button" onClick={() => setProviderDraft({ id: item.id, name: item.name, type: item.type, baseUrl: item.baseUrl ?? '', apiKey: '', apiKeySet: Boolean(item.apiKeySet), apiKeyMasked: item.apiKeyMasked ?? '' })}>编辑</button></div>) : <Empty>还没有 Provider。点击右上角「创建 Provider」添加。</Empty>}</section>
     <section className="panel"><h3>模型列表</h3>{models.length ? models.map((item) => {
       const provider = providers.find((row) => row.id === item.providerId);
       return <div className="data-row" key={item.id}><span>#{item.id} {item.displayName}</span><small>{item.name} · {provider?.name ?? '未知 Provider'} · {provider?.baseUrl || '未填写 API 地址'}</small><button type="button" onClick={() => setModelDraft({ id: item.id, providerId: String(item.providerId), name: item.name, displayName: item.displayName, baseUrl: provider?.baseUrl ?? '' })}>编辑</button></div>;
@@ -1221,16 +1517,18 @@ export default function ControlCenter() {
     {createDialog === 'provider' ? <Modal title="新增 Provider" onClose={() => setCreateDialog(null)}>
       <form className="form" onSubmit={createProvider}>
         <Field label="名称" hint="自己起的名字，用来在列表里区分，例如 MiniMax。"><input value={catalogForm.providerName} onChange={(e) => setCatalogForm({ ...catalogForm, providerName: e.target.value })} placeholder="例如 MiniMax" /></Field>
-        <Field label="类型" hint="模型厂商类型，要和 Pi 能识别的厂商一致，例如 openai、anthropic。"><input value={catalogForm.providerType} onChange={(e) => setCatalogForm({ ...catalogForm, providerType: e.target.value })} placeholder="例如 openai" /></Field>
+        <Field label="类型" hint="模型厂商类型，要和 Pi 能识别的厂商一致，例如 openai、anthropic、minimax。"><input value={catalogForm.providerType} onChange={(e) => setCatalogForm({ ...catalogForm, providerType: e.target.value })} placeholder="例如 openai" /></Field>
         <Field label="API 访问地址" hint="该厂商接口的根地址，例如 https://api.minimaxi.com/v1。同一 Provider 下的模型共用这个地址。官方默认地址可以留空。"><input value={catalogForm.baseUrl} onChange={(e) => setCatalogForm({ ...catalogForm, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" /></Field>
+        <Field label="API Key" hint="必填。执行时会作为 --api-key 传给 Pi，同一 Provider 下的模型共用。"><input type="password" autoComplete="off" value={catalogForm.apiKey} onChange={(e) => setCatalogForm({ ...catalogForm, apiKey: e.target.value })} placeholder="粘贴厂商发放的 API Key" /></Field>
         <div className="run-controls"><button>创建 Provider</button><button type="button" onClick={() => setCreateDialog(null)}>取消</button></div>
       </form>
     </Modal> : null}
     {providerDraft ? <Modal title="编辑 Provider" onClose={() => setProviderDraft(null)}>
       <form className="form" onSubmit={saveProvider}>
         <Field label="名称" hint="自己起的名字，用来在列表里区分，例如 MiniMax。"><input value={providerDraft.name} onChange={(e) => setProviderDraft({ ...providerDraft, name: e.target.value })} /></Field>
-        <Field label="类型" hint="模型厂商类型，要和 Pi 能识别的厂商一致，例如 openai、anthropic。"><input value={providerDraft.type} onChange={(e) => setProviderDraft({ ...providerDraft, type: e.target.value })} /></Field>
+        <Field label="类型" hint="模型厂商类型，要和 Pi 能识别的厂商一致，例如 openai、anthropic、minimax。"><input value={providerDraft.type} onChange={(e) => setProviderDraft({ ...providerDraft, type: e.target.value })} /></Field>
         <Field label="API 访问地址" hint="该厂商接口的根地址。留空表示使用厂商默认地址。同一 Provider 下的模型共用这个地址。"><input value={providerDraft.baseUrl} onChange={(e) => setProviderDraft({ ...providerDraft, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" /></Field>
+        <Field label="API Key" hint={providerDraft.apiKeySet ? `已配置：${providerDraft.apiKeyMasked || '********'}。留空表示保持不变；填写新值则覆盖。` : '必填。执行时会作为 --api-key 传给 Pi。'}><input type="password" autoComplete="off" value={providerDraft.apiKey} onChange={(e) => setProviderDraft({ ...providerDraft, apiKey: e.target.value })} placeholder={providerDraft.apiKeySet ? '留空保持原 Key，或粘贴新 Key' : '粘贴厂商发放的 API Key'} /></Field>
         <div className="run-controls"><button type="submit">保存</button><button type="button" onClick={() => setProviderDraft(null)}>取消</button></div>
       </form>
     </Modal> : null}
@@ -1262,12 +1560,14 @@ export default function ControlCenter() {
       const currentModel = models.find((item) => item.id === current?.modelId);
       const currentProvider = providers.find((item) => item.id === currentModel?.providerId);
       const capabilityText = capabilityKeysOf(agent.capabilitiesJson).map((key) => capabilityName(key)).join('、');
-      return <div className="data-row" key={agent.id}><span>#{agent.id} {agent.name}</span><small>{current ? `${current.version} · ${currentProvider?.name ?? '未绑定 Provider'} / ${currentModel?.displayName ?? '未绑定 Model'} · ${current.role}` : '还没有版本'}{capabilityText ? ` · ${capabilityText}` : ''}{agent.workflowId ? ` · Workflow #${agent.workflowId}` : ''}</small><button type="button" onClick={() => setAgentDraft({ id: agent.id, versionId: current?.id ?? null, name: agent.name, capabilities: capabilityKeysOf(agent.capabilitiesJson), providerId: currentModel ? String(currentModel.providerId) : '', modelId: current ? String(current.modelId) : '', version: current?.version ?? 'v1', role: current?.role ?? agent.name, mission: current?.mission ?? '' })}>编辑</button></div>;
+      const skillText = capabilityKeysOf(agent.skillsJson).map((key) => skillName(key)).join('、');
+      return <div className="data-row" key={agent.id}><span>#{agent.id} {agent.name}</span><small>{current ? `${current.version} · ${currentProvider?.name ?? '未绑定 Provider'} / ${currentModel?.displayName ?? '未绑定 Model'} · ${current.role}` : '还没有版本'}{capabilityText ? ` · 能力 ${capabilityText}` : ''}{skillText ? ` · Skill ${skillText}` : ''}{agent.workflowId ? ` · Workflow #${agent.workflowId}` : ''}</small><button type="button" onClick={() => setAgentDraft({ id: agent.id, versionId: current?.id ?? null, name: agent.name, capabilities: capabilityKeysOf(agent.capabilitiesJson), skills: capabilityKeysOf(agent.skillsJson), providerId: currentModel ? String(currentModel.providerId) : '', modelId: current ? String(current.modelId) : '', version: current?.version ?? 'v1', role: current?.role ?? agent.name, mission: current?.mission ?? '' })}>编辑</button></div>;
     }) : <Empty>此项目还没有 Agent。点击右上角「创建 Agent」添加。</Empty>}</section>
     {createDialog === 'agent' ? <Modal title="新增 Agent" onClose={() => setCreateDialog(null)}>
       <form className="form" onSubmit={createAgent}>
         <Field label="名称" hint="当前项目里这个 Agent 的名字，例如代码构建者。"><input value={agentForm.name} onChange={(e) => setAgentForm({ ...agentForm, name: e.target.value })} placeholder="例如代码构建者" /></Field>
         <CapabilityPicker label="能力" hint="从下拉里选择，可以选多项。Workflow 节点要求的每一项，这个 Agent 都要具备，任务才会派过来。可以不选，但不选时不会自动承接声明了能力的任务。" options={capabilities} selected={agentForm.capabilities} onChange={(capabilities) => setAgentForm({ ...agentForm, capabilities })} />
+        <SkillPicker label="Skill" hint="创建时勾选。例如「网络访问」可搜索网页并抓取 URL。目录在「Skill 管理」维护，后期可增加自定义 Skill。" options={skills} selected={agentForm.skills} onChange={(next) => setAgentForm({ ...agentForm, skills: next })} />
         <Field label="Provider" hint="选择模型管理里已经建好的厂商。"><select value={agentForm.providerId} onChange={(e) => { const providerId = e.target.value; const stillValid = models.some((item) => String(item.id) === agentForm.modelId && String(item.providerId) === providerId); setAgentForm({ ...agentForm, providerId, modelId: providerId && !stillValid ? '' : agentForm.modelId }); }}><option value="">请选择 Provider</option>{providers.map((item) => <option value={item.id} key={item.id}>{item.name} · {item.type}</option>)}</select></Field>
         <Field label="Model" hint="选择该 Provider 下要实际调用的模型。"><select value={agentForm.modelId} onChange={(e) => { const modelId = e.target.value; const model = models.find((item) => String(item.id) === modelId); setAgentForm({ ...agentForm, modelId, providerId: model ? String(model.providerId) : agentForm.providerId }); }}><option value="">请选择 Model</option>{agentModels.map((item) => <option value={item.id} key={item.id}>{item.displayName}{agentForm.providerId ? '' : ` · ${providers.find((provider) => provider.id === item.providerId)?.name ?? ''}`}</option>)}</select></Field>
         <Field label="版本" hint="这次配置的版本号。留空会保存为 v1。"><input value={agentForm.version} onChange={(e) => setAgentForm({ ...agentForm, version: e.target.value })} placeholder="v1" /></Field>
@@ -1291,12 +1591,57 @@ export default function ControlCenter() {
       <form className="form" onSubmit={saveAgent}>
         <Field label="名称" hint="当前项目里这个 Agent 的名字。"><input value={agentDraft.name} onChange={(e) => setAgentDraft({ ...agentDraft, name: e.target.value })} /></Field>
         <CapabilityPicker label="能力" hint="从下拉里添加这个 Agent 能承接的能力。目录在「能力」页面维护。" options={capabilities} selected={agentDraft.capabilities} onChange={(next) => setAgentDraft({ ...agentDraft, capabilities: next })} />
+        <SkillPicker label="Skill" hint="勾选后执行时会开启对应工具，并把 Skill 说明交给 Pi。" options={skills} selected={agentDraft.skills} onChange={(next) => setAgentDraft({ ...agentDraft, skills: next })} />
         <Field label="Provider" hint="这个版本要使用的厂商。"><select value={agentDraft.providerId} onChange={(e) => { const providerId = e.target.value; const stillValid = models.some((item) => String(item.id) === agentDraft.modelId && String(item.providerId) === providerId); setAgentDraft({ ...agentDraft, providerId, modelId: providerId && !stillValid ? '' : agentDraft.modelId }); }}>{providers.map((item) => <option value={item.id} key={item.id}>{item.name} · {item.type}</option>)}</select></Field>
         <Field label="Model" hint="这个版本实际调用的模型。"><select value={agentDraft.modelId} onChange={(e) => { const modelId = e.target.value; const model = models.find((item) => String(item.id) === modelId); setAgentDraft({ ...agentDraft, modelId, providerId: model ? String(model.providerId) : agentDraft.providerId }); }}><option value="">请选择 Model</option>{models.filter((item) => !agentDraft.providerId || String(item.providerId) === agentDraft.providerId).map((item) => <option value={item.id} key={item.id}>{item.displayName}</option>)}</select></Field>
         <Field label="版本" hint="正在修改的是最新一个版本。改版本号时不要和已有版本重复。"><input value={agentDraft.version} onChange={(e) => setAgentDraft({ ...agentDraft, version: e.target.value })} /></Field>
         <Field label="角色" hint="这个版本担任的角色。"><input value={agentDraft.role} onChange={(e) => setAgentDraft({ ...agentDraft, role: e.target.value })} /></Field>
         <Field label="使命" hint="执行时作为补充提示。可以留空。"><input value={agentDraft.mission} onChange={(e) => setAgentDraft({ ...agentDraft, mission: e.target.value })} /></Field>
         <div className="run-controls"><button type="submit">保存</button><button type="button" onClick={() => setAgentDraft(null)}>取消</button></div>
+      </form>
+    </Modal> : null}
+  </div>;
+
+  const skillsView = <div className="view-stack">
+    <SectionTitle title="Skill 目录" action={<button type="button" onClick={() => { setSkillUpload(null); setSkillDialog(true); }}>新增自定义 Skill</button>} />
+    <p className="muted">租户级 Skill，创建 Agent / 节点时可勾选。支持粘贴 SKILL.md，或导入含 scripts 的 zip Skill 包。自定义包统一放在本机 ~/.orvia/skills/ 下，按标识分目录，方便查找维护。系统内置不可删除。</p>
+    <section className="panel"><h3>已有 Skill</h3>{skills.length ? skills.map((item) => {
+      const tools = toolsAllowText(item.toolsJson);
+      const isBuiltin = item.kind === 'builtin';
+      const kindLabel = isBuiltin ? '系统内置' : '自定义';
+      const pkg = skillPackageMeta(item.configJson);
+      return <div className="data-row" key={item.id}><span><strong>{item.name}</strong><small>类型：{kindLabel} · {item.key}{pkg.source === 'package' ? ` · 包 ${pkg.files.length} 个文件` : ''}{tools ? ` · tools ${tools}` : ''}{item.description ? ` · ${item.description}` : ''}</small></span><div className="run-controls"><span className={`badge ${isBuiltin ? 'published' : 'draft'}`}>{kindLabel}</span><button type="button" onClick={() => { setSkillDraftUpload(null); setSkillDraft({ id: item.id, key: item.key, name: item.name, description: item.description ?? '', kind: isBuiltin ? 'builtin' : 'custom', contentMd: item.contentMd ?? '', toolsAllow: tools, files: pkg.files, source: pkg.source }); }}>编辑</button>{isBuiltin ? null : <button type="button" className="danger" onClick={() => void deleteSkill(item.id)}>删除</button>}</div></div>;
+    }) : <Empty>还没有 Skill。启动后会自动写入系统内置「网络访问」。</Empty>}</section>
+    {skillDialog ? <Modal title="新增自定义 Skill" onClose={() => { setSkillDialog(false); setSkillUpload(null); }}>
+      <form className="form" onSubmit={createSkill}>
+        <Field label="类型"><input value="自定义" disabled /></Field>
+        <Field label="导入方式" hint="可手写 SKILL.md，也可上传单个 Markdown，或导入包含 scripts/references 的 zip 包。">
+          <select value={skillForm.source} onChange={(e) => { const source = e.target.value === 'upload' ? 'upload' : 'markdown'; setSkillForm({ ...skillForm, source }); if (source === 'markdown') setSkillUpload(null); }}>
+            <option value="markdown">粘贴 / 编写 SKILL.md</option>
+            <option value="upload">导入 Skill 包或 MD 文件</option>
+          </select>
+        </Field>
+        <Field label="标识" hint="小写英文、数字和下划线，例如 my_research。创建后不能改。"><input value={skillForm.key} onChange={(e) => setSkillForm({ ...skillForm, key: e.target.value })} placeholder="例如 my_research" /></Field>
+        <Field label="中文名称" hint="在 Agent 勾选列表里显示的名字。导入包时可先填，也可留空后用 frontmatter 的 name。"><input value={skillForm.name} onChange={(e) => setSkillForm({ ...skillForm, name: e.target.value })} placeholder="例如 调研助手" /></Field>
+        <Field label="说明" hint="给人看的一句话。"><input value={skillForm.description} onChange={(e) => setSkillForm({ ...skillForm, description: e.target.value })} placeholder="例如按步骤做公开资料调研" /></Field>
+        <Field label="开启的工具" hint="逗号分隔的 Pi 工具名。含脚本的包通常需要 bash。"><input value={skillForm.toolsAllow} onChange={(e) => setSkillForm({ ...skillForm, toolsAllow: e.target.value })} placeholder="bash" /></Field>
+        {skillForm.source === 'upload' ? <Field label="Skill 包 / MD 文件" hint="推荐 zip：内含 SKILL.md，以及 scripts、references、assets 等。也支持只上传 SKILL.md。"><input type="file" accept=".zip,.md,.markdown,application/zip,text/markdown" onChange={(e) => setSkillUpload(e.target.files?.[0] ?? null)} />{skillUpload ? <small className="field-hint">已选：{skillUpload.name}</small> : null}</Field> : <Field label="SKILL.md 内容" hint="符合 Agent Skills 规范的 Markdown，会通过 Pi 的 --skill 加载。"><textarea value={skillForm.contentMd} onChange={(e) => setSkillForm({ ...skillForm, contentMd: e.target.value })} rows={10} placeholder={'---\nname: my-research\ndescription: ...\n---\n\n# 说明\n'} /></Field>}
+        <div className="run-controls"><button>保存</button><button type="button" onClick={() => { setSkillDialog(false); setSkillUpload(null); }}>取消</button></div>
+      </form>
+    </Modal> : null}
+    {skillDraft ? <Modal title="编辑 Skill" onClose={() => { setSkillDraft(null); setSkillDraftUpload(null); }}>
+      <form className="form" onSubmit={saveSkill}>
+        <Field label="类型"><input value={skillDraft.kind === 'builtin' ? '系统内置' : '自定义'} disabled /></Field>
+        <Field label="标识"><input value={skillDraft.key} disabled /></Field>
+        {skillDraft.kind === 'builtin' ? <Field label="说明"><input value={skillDraft.description} onChange={(e) => setSkillDraft({ ...skillDraft, description: e.target.value })} /></Field> : <>
+          <Field label="中文名称"><input value={skillDraft.name} onChange={(e) => setSkillDraft({ ...skillDraft, name: e.target.value })} /></Field>
+          <Field label="说明"><input value={skillDraft.description} onChange={(e) => setSkillDraft({ ...skillDraft, description: e.target.value })} /></Field>
+          <Field label="开启的工具"><input value={skillDraft.toolsAllow} onChange={(e) => setSkillDraft({ ...skillDraft, toolsAllow: e.target.value })} /></Field>
+          {skillDraft.files.length ? <Field label="包内文件"><input value={skillDraft.files.join(', ')} disabled /></Field> : null}
+          <Field label="重新导入包" hint="可选。上传新的 zip / md 会替换本地包（含脚本）。"><input type="file" accept=".zip,.md,.markdown,application/zip,text/markdown" onChange={(e) => setSkillDraftUpload(e.target.files?.[0] ?? null)} />{skillDraftUpload ? <small className="field-hint">已选：{skillDraftUpload.name}</small> : null}</Field>
+          <Field label="SKILL.md 内容"><textarea value={skillDraft.contentMd} onChange={(e) => setSkillDraft({ ...skillDraft, contentMd: e.target.value })} rows={10} /></Field>
+        </>}
+        <div className="run-controls"><button type="submit">保存</button><button type="button" onClick={() => { setSkillDraft(null); setSkillDraftUpload(null); }}>取消</button></div>
       </form>
     </Modal> : null}
   </div>;
@@ -1429,10 +1774,10 @@ export default function ControlCenter() {
         <div className="run-controls"><button type="submit">创建并打开</button><button type="button" onClick={() => setCreateDialog(null)}>取消</button></div>
       </form>
     </Modal> : null}
-    {board && workflowId ? <WorkflowBoard key={workflowId} mode={board} name={workflowForm.name} version={workflowForm.version} versions={workflowVersions} currentVersionId={currentVersionId} nodes={workflowNodesForm} edges={workflowEdgesForm} loops={workflowLoops} capabilities={capabilities} events={boardEvents} progress={liveProgress ?? nodeProgress(runDetail?.tasks)} checks={liveChecks ?? nodeChecks(runDetail?.tasks, boardEvents)} deliverables={liveDeliverables ?? nodeDeliverables(runDetail?.tasks)} runStatus={runDetail ? statusText(runDetail.status) : '未运行'} runStatusCode={runDetail?.status} onClose={() => void closeBoard()} onName={(name) => setWorkflowForm({ ...workflowForm, name })} onSelectVersion={(versionId) => void requestVersionSwitch(versionId)} onNodes={setWorkflowNodesForm} onEdges={setWorkflowEdgesForm} onLoops={setWorkflowLoops} onPersist={persistBoard} onPublish={() => void publishWorkflow()} onExecute={() => void runAction('execute')} onStop={stopRun} directory={workflowDirectory} decisions={pendingDecisions.filter((item) => item.workflowRunId === runId)} decisionNotes={decisionText} onDecisionNote={(id, text) => setDecisionText({ ...decisionText, [id]: text })} onResolveDecision={(id, action) => void resolveDecision(id, action)} onOpenDirectory={async () => { if (!workflowId) return; try { const opened = await request<{ root: string }>(`/api/workflows/${workflowId}/open`, {}); setWorkflowDirectory(opened.root); setNotice('已在访达中打开主目录'); } catch (cause) { fail(cause, '目录打开失败'); } }} onOpenDeliverable={async (directory) => { if (!workflowId) return; try { await request(`/api/workflows/${workflowId}/open`, { directory }); setNotice('已在访达中打开交付物目录'); } catch (cause) { fail(cause, '目录打开失败'); } }} onLoadSummary={async () => { if (!runId) throw new Error('还没有执行记录'); return request<{ nodes: SummaryNode[] }>(`/api/workflow-runs/${runId}/summary`); }} onReadFile={async (filePath) => { if (!workflowId) throw new Error('请先打开 Workflow'); return request<{ name: string; text?: string; binary?: boolean; path?: string }>(`/api/workflows/${workflowId}/file?path=${encodeURIComponent(filePath)}`); }} onListFiles={() => request<{ directory: string; files: { name: string; size: number }[] }>(`/api/workflows/${workflowId}/files`)} onUploadFile={async (file) => { const response = await fetch(`${API_URL}/api/workflows/${workflowId}/files`, { method: 'POST', headers: { ...authHeaders(), 'x-orvia-filename': encodeURIComponent(file.name) }, body: file }); if (!response.ok) { const data = await response.json().catch(() => ({})) as { error?: string }; throw new Error(data.error ?? '上传失败'); } }} onDeleteFile={(name) => request(`/api/workflows/${workflowId}/files?name=${encodeURIComponent(name)}`, undefined, 'DELETE').then(() => undefined)} chatNode={chatNodeKey ? workflowNodesForm.find((node) => node.key === chatNodeKey) ?? null : null} chatMessages={nodeMessages} chatError={chatError} onOpenChat={(key) => { setChatError(''); setChatNodeKey(key); }} onCloseChat={() => { setChatNodeKey(null); setChatError(''); }} onSendChat={sendNodeChat} /> : null}
+    {board && workflowId ? <WorkflowBoard key={workflowId} mode={board} name={workflowForm.name} version={workflowForm.version} versions={workflowVersions} currentVersionId={currentVersionId} nodes={workflowNodesForm} edges={workflowEdgesForm} loops={workflowLoops} capabilities={capabilities} skills={skills} providers={providers} models={models} events={boardEvents} progress={liveProgress ?? nodeProgress(runDetail?.tasks)} failures={liveFailures ?? nodeFailures(runDetail?.tasks)} checks={liveChecks ?? nodeChecks(runDetail?.tasks, boardEvents)} deliverables={liveDeliverables ?? nodeDeliverables(runDetail?.tasks)} reviewHistories={nodeReviewHistories(runDetail?.tasks)} runStatus={runDetail ? statusText(runDetail.status) : '未运行'} runStatusCode={runDetail?.status} onClose={() => void closeBoard()} onName={(name) => setWorkflowForm({ ...workflowForm, name })} onSelectVersion={(versionId) => void requestVersionSwitch(versionId)} onNodes={setWorkflowNodesForm} onEdges={setWorkflowEdgesForm} onLoops={setWorkflowLoops} onPersist={persistBoard} onPublish={() => void publishWorkflow()} onExecute={() => void runAction('execute')} onStop={stopRun} directory={workflowDirectory} decisions={decisions.filter((item) => item.workflowRunId === runId && item.status !== 'superseded')} decisionNotes={decisionText} onDecisionNote={(id, text) => setDecisionText({ ...decisionText, [id]: text })} onResolveDecision={(id, action, options) => void resolveDecision(id, action, options)} onOpenDirectory={async () => { if (!workflowId) return; try { const opened = await request<{ root: string }>(`/api/workflows/${workflowId}/open`, {}); setWorkflowDirectory(opened.root); setNotice('已在访达中打开主目录'); } catch (cause) { fail(cause, '目录打开失败'); } }} onOpenDeliverable={async (directory) => { if (!workflowId) return; try { await request(`/api/workflows/${workflowId}/open`, { directory }); setNotice('已在访达中打开交付物目录'); } catch (cause) { fail(cause, '目录打开失败'); } }} onLoadSummary={async () => { if (!runId) throw new Error('还没有执行记录'); return request<{ nodes: SummaryNode[] }>(`/api/workflow-runs/${runId}/summary`); }} onReadFile={async (filePath) => { if (!workflowId) throw new Error('请先打开 Workflow'); return request<{ name: string; text?: string; binary?: boolean; path?: string }>(`/api/workflows/${workflowId}/file?path=${encodeURIComponent(filePath)}`); }} onListFiles={() => request<{ directory: string; files: { name: string; size: number }[] }>(`/api/workflows/${workflowId}/files`)} onUploadFile={async (file) => { const response = await fetch(`${API_URL}/api/workflows/${workflowId}/files`, { method: 'POST', headers: { ...authHeaders(), 'x-orvia-filename': encodeURIComponent(file.name) }, body: file }); if (!response.ok) { const data = await response.json().catch(() => ({})) as { error?: string }; throw new Error(data.error ?? '上传失败'); } }} onDeleteFile={(name) => request(`/api/workflows/${workflowId}/files?name=${encodeURIComponent(name)}`, undefined, 'DELETE').then(() => undefined)} chatNode={chatNodeKey ? workflowNodesForm.find((node) => node.key === chatNodeKey) ?? null : null} chatMessages={nodeMessages} chatError={chatError} onOpenChat={(key) => { setChatError(''); setChatNodeKey(key); }} onCloseChat={() => { setChatNodeKey(null); setChatError(''); }} onSendChat={sendNodeChat} onStopChat={stopNodeChat} /> : null}
   </div>;
 
-  const views: Record<View, React.ReactNode> = { overview, models: modelsView, agents: agentsView, capabilities: capabilitiesView, workflows: workflowsView, settings: settingsView };
+  const views: Record<View, React.ReactNode> = { overview, models: modelsView, agents: agentsView, capabilities: capabilitiesView, skills: skillsView, workflows: workflowsView, settings: settingsView };
 
   return <main className="app-shell">
     <aside className="sidebar"><div className="brand"><span>O</span><div><strong>ORVIA</strong></div></div><nav aria-label="主导航">{NAV.map((item) => <button key={item.id} className={view === item.id ? 'active' : ''} onClick={() => setView(item.id)}><i>{item.icon}</i>{item.label}{item.id === 'workflows' && pendingDecisions.length > 0 && <em>{pendingDecisions.length}</em>}</button>)}</nav></aside>

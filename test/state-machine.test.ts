@@ -19,12 +19,13 @@ test('workflow run state machine allows human checkpoint flow', () => {
   assert.doesNotThrow(() => assertRunTransition('cancelled', 'running'));
 });
 
-test('task state machine supports retry without reopening completed tasks', () => {
+test('task state machine supports retry and human return redo', () => {
   assert.equal(canTransitionTask('failed', 'pending'), true);
   assert.equal(canTransitionTask('blocked', 'pending'), true);
   assert.equal(canTransitionTask('blocked', 'running'), true);
   assert.equal(canTransitionTask('paused', 'pending'), true);
-  assert.equal(canTransitionTask('completed', 'pending'), false);
+  assert.equal(canTransitionTask('awaiting_decision', 'blocked'), true);
+  assert.equal(canTransitionTask('completed', 'pending'), true);
   assert.doesNotThrow(() => assertTaskTransition('running', 'awaiting_decision'));
   assert.throws(() => assertTaskTransition('completed', 'running'));
 });
