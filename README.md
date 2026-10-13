@@ -92,28 +92,6 @@ pi
 2. 执行 `/model`，选中要使用的模型，按 `Ctrl+S` 存成新会话的默认模型。Orvia 每次都是一次新的调用，只在当前会话里切换模型不会作用到 Orvia。
 3. 需要思考深度时执行 `/thinking`，同样可以用 `Ctrl+S` 保存启动时的级别。
 
-
-Pi 自带目录里没有的接口，写到 `~/.pi/agent/models.json`。下面是一个兼容 OpenAI 接口的例子：
-
-```json
-{
-  "providers": {
-    "example": {
-      "baseUrl": "https://api.example.com/v1",
-      "api": "openai-completions",
-      "apiKey": "$EXAMPLE_API_KEY",
-      "models": [
-        { "id": "your-model-id" }
-      ]
-    }
-  }
-}
-```
-
-保存后重新打开 Pi，用 `/model` 选中该模型并按 `Ctrl+S`。也可以在 `~/.pi/agent/settings.json` 里直接写 `defaultProvider` 和 `defaultModel`。
-
-配置目录默认是 `~/.pi/agent`，可以用环境变量 `PI_CODING_AGENT_DIR` 改到别处。更完整的厂商列表见 [Pi 文档](https://pi.dev)。
-
 ### 4. 启动
 
 开两个终端，都在仓库根目录。
