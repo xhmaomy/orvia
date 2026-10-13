@@ -66,13 +66,9 @@ REDIS_URL=redis://127.0.0.1:6379
 WEB_ORIGIN=http://localhost:3000
 ```
 
-Redis 有密码时写成 `redis://:密码@127.0.0.1:6379`。不要把 `.env` 提交到 Git。
-
-`.env` 里的 `PI_COMMAND` 默认是 `pi`。启动 API 的终端必须能执行这个命令。命令不在 `PATH` 里时，改成它的完整路径。
-
 ### 3. 配置 Pi
 
-Orvia 执行节点、校验上游产物、以及侧栏对话时，都在 API 所在机器上启动 Pi。启动命令不带 `--provider` 和 `--model`：
+Orvia 执行节点、校验上游产物、以及侧栏对话时，都在 API 所在机器上启动 Pi。
 
 ```bash
 pi --print --mode json --no-session -- <任务提示>
