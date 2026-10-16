@@ -1,5 +1,5 @@
-import ControlCenter from '../../components/ControlCenter';
+import { redirect } from 'next/navigation';
 
 export default function Page() {
-  return <ControlCenter />;
+  redirect('/workflows');
 }

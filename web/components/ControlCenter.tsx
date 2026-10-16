@@ -10,12 +10,10 @@ type Id = number;
 type Project = { id: Id; name: string; description?: string | null; createdAt?: string; workflowCount?: number };
 type Provider = { id: Id; name: string; type: string; baseUrl?: string | null; apiKeySet?: boolean; apiKeyMasked?: string };
 type Model = { id: Id; providerId: Id; name: string; displayName: string };
-type Agent = { id: Id; name: string; description?: string; capabilitiesJson?: unknown; skillsJson?: unknown; workflowId?: number | null };
 type CapabilityRow = { id: Id; key: string; name: string; description?: string | null; tenantId?: Id };
 type SkillRow = { id: Id; key: string; name: string; description?: string | null; kind?: 'builtin' | 'custom'; toolsJson?: unknown; contentMd?: string | null; configJson?: unknown; tenantId?: Id };
 type WorkflowNodeDraft = { key: string; name: string; type: 'task' | 'checkpoint' | 'start' | 'end'; capabilities: string[]; skills: string[]; modelId: number | null; question: string; instruction: string; outputRequirement: string; acceptanceRule: string; maxRedos: number; requirement: string; x: number; y: number; w: number; h: number };
 type WorkflowLoop = { key: string; nodeKeys: string[]; maxIterations: number };
-type AgentVersion = { id: Id; agentId: Id; modelId: Id; version: string; role: string; mission?: string };
 type Workflow = { id: Id; name: string; version: string; status: string; runStatus?: string | null; definitionJson?: unknown; projectId?: Id; projectName?: string; createdAt?: string; updatedAt?: string };
 type Run = { id: Id; workflowId: Id; status: string; currentPlanVersion?: number; startedAt?: string; completedAt?: string; errorJson?: unknown };
 type EventRow = { id: Id; type: string; payloadJson?: unknown; payload?: unknown; createdAt?: string; occurredAt?: string; workflowRunId?: Id; taskId?: Id | null };
@@ -35,7 +33,7 @@ type Decision = {
 type Checkpoint = { id: Id; workflowRunId: Id; title: string; instructions?: string; status: string; contextJson?: unknown };
 type RunDetail = Run & { plans: AnyRow[]; tasks: AnyRow[]; sessions: AnyRow[]; checkpoints: Checkpoint[]; decisions: Decision[]; events: EventRow[] };
 type AnyRow = Record<string, unknown> & { id: Id; status?: string; name?: string };
-type View = 'overview' | 'models' | 'agents' | 'capabilities' | 'skills' | 'workflows' | 'settings';
+type View = 'overview' | 'models' | 'capabilities' | 'skills' | 'workflows' | 'settings';
 type LoadState = 'loading' | 'ready' | 'error';
 type TenantRow = { tenantId: number; name: string; slug?: string; role?: string };
 type SystemSettings = {
@@ -47,7 +45,7 @@ type SystemSettings = {
 
 const API_URL = process.env.NEXT_PUBLIC_ORVIA_API_URL ?? 'http://127.0.0.1:4100';
 const PATHS: Record<View, string> = {
-  overview: '/', models: '/models', agents: '/agents', capabilities: '/capabilities', skills: '/skills', workflows: '/workflows', settings: '/settings',
+  overview: '/', models: '/models', capabilities: '/capabilities', skills: '/skills', workflows: '/workflows', settings: '/settings',
 };
 let apiToken = '';
 let apiTenantId: number | undefined;
@@ -63,7 +61,6 @@ function viewFromPath(pathname: string): View {
 }
 const NAV: { id: View; label: string; icon: string }[] = [
   { id: 'overview', label: 'Overview', icon: '⌂' }, { id: 'models', label: '模型管理', icon: '◎' },
-  { id: 'agents', label: 'Agent', icon: '◉' },
   { id: 'capabilities', label: '能力', icon: '✦' },
   { id: 'skills', label: 'Skill 管理', icon: '⚡' },
   { id: 'workflows', label: 'Workflow Builder', icon: '◇' },
@@ -303,26 +300,6 @@ function SectionTitle({ eyebrow, title, action }: { eyebrow?: string; title: str
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return <label>{label}{children}{hint ? <small className="field-hint">{hint}</small> : null}</label>;
 }
-function capabilityKeysOf(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
-}
-function CatalogPicker({ label, hint, emptyLabel, options, selected, onChange }: { label: string; hint: string; emptyLabel: string; options: { key: string; name: string; description?: string | null }[]; selected: string[]; onChange: (next: string[]) => void }) {
-  const chosen = selected.map((key) => options.find((item) => item.key.toLowerCase() === key.toLowerCase()) ?? { key, name: key, description: null });
-  const remaining = options.filter((item) => !selected.some((key) => key.toLowerCase() === item.key));
-  return <div className="capability-picker">
-    <label>{label}<select value="" onChange={(event) => { const key = event.target.value; if (key) onChange([...selected, key]); }}>
-      <option value="">{options.length ? (remaining.length ? emptyLabel : '目录项都已选上') : '目录还是空的'}</option>
-      {remaining.map((item) => <option value={item.key} key={item.key}>{item.name} · {item.key}</option>)}
-    </select><small className="field-hint">{hint}</small></label>
-    {chosen.length ? <div className="picked-list">{chosen.map((item) => <div className="picked-item" key={item.key}><span>{item.name}</span><small>{item.key}</small><button type="button" onClick={() => onChange(selected.filter((key) => key.toLowerCase() !== item.key.toLowerCase()))}>移除</button></div>)}</div> : null}
-  </div>;
-}
-function CapabilityPicker({ label, hint, options, selected, onChange }: { label: string; hint: string; options: CapabilityRow[]; selected: string[]; onChange: (next: string[]) => void }) {
-  return <CatalogPicker label={label} hint={hint} emptyLabel="请选择能力" options={options} selected={selected} onChange={onChange} />;
-}
-function SkillPicker({ label, hint, options, selected, onChange }: { label: string; hint: string; options: SkillRow[]; selected: string[]; onChange: (next: string[]) => void }) {
-  return <CatalogPicker label={label} hint={hint} emptyLabel="请选择 Skill" options={options} selected={selected} onChange={onChange} />;
-}
 function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
@@ -349,10 +326,8 @@ export default function ControlCenter() {
   const [projectId, setProjectId] = useState<Id | null>(null);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [models, setModels] = useState<Model[]>([]);
-  const [agents, setAgents] = useState<Agent[]>([]);
   const [capabilities, setCapabilities] = useState<CapabilityRow[]>([]);
   const [skills, setSkills] = useState<SkillRow[]>([]);
-  const [versions, setVersions] = useState<AgentVersion[]>([]);
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [workflowId, setWorkflowId] = useState<Id | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
@@ -381,13 +356,10 @@ export default function ControlCenter() {
 
   const [providerChoice, setProviderChoice] = useState('');
   const [projectName, setProjectName] = useState('');
-  const [agentForm, setAgentForm] = useState({ name: '', capabilities: [] as string[], skills: [] as string[], providerId: '', modelId: '', version: 'v1', role: '', mission: '' });
-  const [versionForm, setVersionForm] = useState({ agentId: '', providerId: '', modelId: '', version: 'v1', role: '', mission: '' });
   const [catalogForm, setCatalogForm] = useState({ providerName: '', providerType: 'openai', baseUrl: '', apiKey: '', modelName: '', displayName: '' });
   const [modelDraft, setModelDraft] = useState<{ id: Id; providerId: string; name: string; displayName: string; baseUrl: string } | null>(null);
   const [providerDraft, setProviderDraft] = useState<{ id: Id; name: string; type: string; baseUrl: string; apiKey: string; apiKeySet: boolean; apiKeyMasked: string } | null>(null);
-  const [agentDraft, setAgentDraft] = useState<{ id: Id; versionId: Id | null; name: string; capabilities: string[]; skills: string[]; providerId: string; modelId: string; version: string; role: string; mission: string } | null>(null);
-  const [createDialog, setCreateDialog] = useState<'provider' | 'model' | 'agent' | 'version' | 'project' | 'workflow' | null>(null);
+  const [createDialog, setCreateDialog] = useState<'provider' | 'model' | 'project' | 'workflow' | null>(null);
   const [projectDraft, setProjectDraft] = useState<{ id: Id; name: string } | null>(null);
   const [newWorkflowProjectId, setNewWorkflowProjectId] = useState('');
   const [workflowProjectFilter, setWorkflowProjectFilter] = useState('');
@@ -435,11 +407,10 @@ export default function ControlCenter() {
   }, []);
 
   const loadGlobal = useCallback(async () => {
-    const [projectRows, providerRows, modelRows, versionRows, workflowRows, capabilityRows, skillRows] = await Promise.all([
+    const [projectRows, providerRows, modelRows, workflowRows, capabilityRows, skillRows] = await Promise.all([
       list<Project>('/api/projects'),
       list<Provider>('/api/model-providers'),
       list<Model>('/api/models'),
-      list<AgentVersion>('/api/agent-versions'),
       list<Workflow>('/api/workflows'),
       list<CapabilityRow>('/api/capabilities'),
       list<SkillRow>('/api/skills'),
@@ -447,7 +418,6 @@ export default function ControlCenter() {
     setProjects(projectRows);
     setProviders(providerRows);
     setModels(modelRows);
-    setVersions(versionRows);
     setWorkflows(workflowRows);
     setCapabilities(capabilityRows);
     setSkills(skillRows);
@@ -456,15 +426,13 @@ export default function ControlCenter() {
   const loadProject = useCallback(async (id: Id) => {
     setState('loading'); setError('');
     try {
-      const [agentRows, dashboard, decisionRows, workflowRows, capabilityRows, skillRows] = await Promise.all([
-        list<Agent>(`/api/agents?projectId=${id}`),
+      const [dashboard, decisionRows, workflowRows, capabilityRows, skillRows] = await Promise.all([
         request<Center>(`/api/control-center?projectId=${id}`),
         list<Decision>(`/api/decisions?projectId=${id}`),
         list<Workflow>('/api/workflows'),
         list<CapabilityRow>('/api/capabilities'),
         list<SkillRow>('/api/skills'),
       ]);
-      setAgents(agentRows);
       setCenter(dashboard);
       setDecisions(decisionRows);
       setWorkflows(workflowRows);
@@ -697,8 +665,6 @@ export default function ControlCenter() {
     return () => { source.close(); socket.close(); setSse('idle'); };
   }, [projectId, runId, loadRun, token]);
 
-  const agentModels = agentForm.providerId ? models.filter((item) => item.providerId === Number(agentForm.providerId)) : models;
-  const versionModels = versionForm.providerId ? models.filter((item) => item.providerId === Number(versionForm.providerId)) : models;
   const project = projects.find((item) => item.id === projectId);
   const pendingDecisions = decisions.filter((item) => item.status === 'pending');
   const currentEvents = liveEvents.length ? liveEvents : center?.recentEvents ?? [];
@@ -853,66 +819,6 @@ export default function ControlCenter() {
       await loadGlobal();
     }, '模型已更新');
   }
-  function requireCatalogModel(providerId: string, modelId: string) {
-    if (!providers.length) throw new Error('还没有可用的 Provider，请先到「模型管理」创建');
-    if (!providerId) throw new Error('请选择可用的 Provider');
-    const provider = providers.find((item) => item.id === Number(providerId));
-    if (!provider) throw new Error('所选 Provider 不存在，请到「模型管理」确认');
-    const owned = models.filter((item) => item.providerId === provider.id);
-    if (!modelId) throw new Error(owned.length ? '请选择该 Provider 下的 Model' : '这个 Provider 下还没有 Model，请先到「模型管理」创建');
-    const model = models.find((item) => item.id === Number(modelId));
-    if (!model || model.providerId !== provider.id) throw new Error('所选 Model 不属于所选 Provider');
-    return model;
-  }
-  async function createAgentFrom(form: { name: string; capabilities: string[]; skills: string[]; providerId: string; modelId: string; version: string; role: string; mission: string }) {
-    return act('agent', async () => {
-      const id = requireProject();
-      if (!form.name.trim()) throw new Error('请输入 Agent 名称');
-      const model = requireCatalogModel(form.providerId, form.modelId);
-      const created = await request<{ id: Id }>('/api/agents', { projectId: id, name: form.name.trim(), capabilitiesJson: form.capabilities, skillsJson: form.skills });
-      await request('/api/agent-versions', { agentId: created.id, modelId: model.id, version: form.version.trim() || 'v1', role: form.role.trim() || form.name.trim(), mission: form.mission.trim() || undefined });
-      await loadGlobal(); await loadProject(id);
-      setAgentForm((value) => ({ ...value, name: '', capabilities: [], skills: [], role: '', mission: '' }));
-      setCreateDialog(null);
-    }, 'Agent 已创建，并绑定了所选 Provider 的 Model');
-  }
-  async function createAgent(e: FormEvent) {
-    e.preventDefault();
-    await createAgentFrom(agentForm);
-  }
-  async function createVersion(e: FormEvent) {
-    e.preventDefault();
-    await act('version', async () => {
-      if (!versionForm.agentId) throw new Error('请选择要增加版本的 Agent');
-      const model = requireCatalogModel(versionForm.providerId, versionForm.modelId);
-      const agent = agents.find((item) => item.id === Number(versionForm.agentId));
-      await request('/api/agent-versions', { agentId: Number(versionForm.agentId), modelId: model.id, version: versionForm.version.trim() || 'v1', role: versionForm.role.trim() || agent?.name, mission: versionForm.mission.trim() || undefined });
-      await loadGlobal(); setVersionForm((value) => ({ ...value, role: '', mission: '' }));
-      setCreateDialog(null);
-    }, 'Agent Version 已绑定');
-  }
-  async function saveAgentFrom(draft: { id: Id; versionId: Id | null; name: string; capabilities: string[]; skills: string[]; providerId: string; modelId: string; version: string; role: string; mission: string }) {
-    return act('agent-edit', async () => {
-      if (!draft.name.trim()) throw new Error('请输入 Agent 名称');
-      const model = requireCatalogModel(draft.providerId, draft.modelId);
-      if (!draft.version.trim()) throw new Error('请填写版本号');
-      if (!draft.role.trim()) throw new Error('请填写角色');
-      await request(`/api/agents/${draft.id}`, { name: draft.name.trim(), capabilitiesJson: draft.capabilities, skillsJson: draft.skills }, 'PATCH');
-      if (draft.versionId) {
-        await request(`/api/agent-versions/${draft.versionId}`, { modelId: model.id, version: draft.version.trim(), role: draft.role.trim(), mission: draft.mission.trim() }, 'PATCH');
-      } else {
-        await request('/api/agent-versions', { agentId: draft.id, modelId: model.id, version: draft.version.trim(), role: draft.role.trim(), mission: draft.mission.trim() || undefined });
-      }
-      if (projectId) await loadProject(projectId);
-      await loadGlobal();
-      setAgentDraft(null);
-    }, 'Agent 已更新');
-  }
-  async function saveAgent(e: FormEvent) {
-    e.preventDefault();
-    if (!agentDraft) return;
-    await saveAgentFrom(agentDraft);
-  }
   async function createCapability(e: FormEvent) {
     e.preventDefault();
     await act('capability', async () => {
@@ -933,12 +839,6 @@ export default function ControlCenter() {
       await loadGlobal();
       setCapabilityDraft(null);
     }, '能力已更新');
-  }
-  function capabilityName(key: string) {
-    return capabilities.find((item) => item.key === key.toLowerCase())?.name ?? key;
-  }
-  function skillName(key: string) {
-    return skills.find((item) => item.key === key.toLowerCase())?.name ?? key;
   }
   function toolsAllowText(value: unknown): string {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
@@ -1552,59 +1452,9 @@ export default function ControlCenter() {
     </Modal> : null}
   </div>;
 
-  const agentsView = <div className="view-stack">
-    <SectionTitle eyebrow="Registry" title="已创建的 Agent" action={<div className="run-controls"><button type="button" onClick={() => setCreateDialog('agent')}>创建 Agent</button><button type="button" onClick={() => setCreateDialog('version')}>增加版本</button></div>} />
-    <section className="panel"><h3>Agent 列表</h3>{!projectId ? <Empty>还没有可用项目。</Empty> : agents.length ? agents.map((agent) => {
-      const agentVersions = versions.filter((version) => version.agentId === agent.id);
-      const current = agentVersions.reduce<AgentVersion | undefined>((latest, version) => !latest || version.id > latest.id ? version : latest, undefined);
-      const currentModel = models.find((item) => item.id === current?.modelId);
-      const currentProvider = providers.find((item) => item.id === currentModel?.providerId);
-      const capabilityText = capabilityKeysOf(agent.capabilitiesJson).map((key) => capabilityName(key)).join('、');
-      const skillText = capabilityKeysOf(agent.skillsJson).map((key) => skillName(key)).join('、');
-      return <div className="data-row" key={agent.id}><span>#{agent.id} {agent.name}</span><small>{current ? `${current.version} · ${currentProvider?.name ?? '未绑定 Provider'} / ${currentModel?.displayName ?? '未绑定 Model'} · ${current.role}` : '还没有版本'}{capabilityText ? ` · 能力 ${capabilityText}` : ''}{skillText ? ` · Skill ${skillText}` : ''}{agent.workflowId ? ` · Workflow #${agent.workflowId}` : ''}</small><button type="button" onClick={() => setAgentDraft({ id: agent.id, versionId: current?.id ?? null, name: agent.name, capabilities: capabilityKeysOf(agent.capabilitiesJson), skills: capabilityKeysOf(agent.skillsJson), providerId: currentModel ? String(currentModel.providerId) : '', modelId: current ? String(current.modelId) : '', version: current?.version ?? 'v1', role: current?.role ?? agent.name, mission: current?.mission ?? '' })}>编辑</button></div>;
-    }) : <Empty>此项目还没有 Agent。点击右上角「创建 Agent」添加。</Empty>}</section>
-    {createDialog === 'agent' ? <Modal title="新增 Agent" onClose={() => setCreateDialog(null)}>
-      <form className="form" onSubmit={createAgent}>
-        <Field label="名称" hint="当前项目里这个 Agent 的名字，例如代码构建者。"><input value={agentForm.name} onChange={(e) => setAgentForm({ ...agentForm, name: e.target.value })} placeholder="例如代码构建者" /></Field>
-        <CapabilityPicker label="能力" hint="从下拉里选择，可以选多项。Workflow 节点要求的每一项，这个 Agent 都要具备，任务才会派过来。可以不选，但不选时不会自动承接声明了能力的任务。" options={capabilities} selected={agentForm.capabilities} onChange={(capabilities) => setAgentForm({ ...agentForm, capabilities })} />
-        <SkillPicker label="Skill" hint="创建时勾选。例如「网络访问」可搜索网页并抓取 URL。目录在「Skill 管理」维护，后期可增加自定义 Skill。" options={skills} selected={agentForm.skills} onChange={(next) => setAgentForm({ ...agentForm, skills: next })} />
-        <Field label="Provider" hint="选择模型管理里已经建好的厂商。"><select value={agentForm.providerId} onChange={(e) => { const providerId = e.target.value; const stillValid = models.some((item) => String(item.id) === agentForm.modelId && String(item.providerId) === providerId); setAgentForm({ ...agentForm, providerId, modelId: providerId && !stillValid ? '' : agentForm.modelId }); }}><option value="">请选择 Provider</option>{providers.map((item) => <option value={item.id} key={item.id}>{item.name} · {item.type}</option>)}</select></Field>
-        <Field label="Model" hint="选择该 Provider 下要实际调用的模型。"><select value={agentForm.modelId} onChange={(e) => { const modelId = e.target.value; const model = models.find((item) => String(item.id) === modelId); setAgentForm({ ...agentForm, modelId, providerId: model ? String(model.providerId) : agentForm.providerId }); }}><option value="">请选择 Model</option>{agentModels.map((item) => <option value={item.id} key={item.id}>{item.displayName}{agentForm.providerId ? '' : ` · ${providers.find((provider) => provider.id === item.providerId)?.name ?? ''}`}</option>)}</select></Field>
-        <Field label="版本" hint="这次配置的版本号。留空会保存为 v1。"><input value={agentForm.version} onChange={(e) => setAgentForm({ ...agentForm, version: e.target.value })} placeholder="v1" /></Field>
-        <Field label="角色" hint="这个版本担任的角色，例如构建者、审查者。留空会使用 Agent 名称。"><input value={agentForm.role} onChange={(e) => setAgentForm({ ...agentForm, role: e.target.value })} placeholder="例如构建者" /></Field>
-        <Field label="使命" hint="给这个版本的任务说明，执行时会作为补充提示。可以留空。"><input value={agentForm.mission} onChange={(e) => setAgentForm({ ...agentForm, mission: e.target.value })} placeholder="例如产出可审查的代码改动" /></Field>
-        <div className="run-controls"><button>创建 Agent</button><button type="button" onClick={() => setCreateDialog(null)}>取消</button></div>
-      </form>
-    </Modal> : null}
-    {createDialog === 'version' ? <Modal title="为已有 Agent 增加版本" onClose={() => setCreateDialog(null)}>
-      <form className="form" onSubmit={createVersion}>
-        <Field label="Agent" hint="要追加版本的已有 Agent。能力标识仍属于 Agent 本身，这里不需要再填。"><select value={versionForm.agentId} onChange={(e) => setVersionForm({ ...versionForm, agentId: e.target.value })}><option value="">请选择 Agent</option>{agents.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></Field>
-        <Field label="Provider" hint="这个版本要使用的厂商，从模型管理里已有的 Provider 中选择。"><select value={versionForm.providerId} onChange={(e) => { const providerId = e.target.value; const stillValid = models.some((item) => String(item.id) === versionForm.modelId && String(item.providerId) === providerId); setVersionForm({ ...versionForm, providerId, modelId: providerId && !stillValid ? '' : versionForm.modelId }); }}><option value="">请选择 Provider</option>{providers.map((item) => <option value={item.id} key={item.id}>{item.name} · {item.type}</option>)}</select></Field>
-        <Field label="Model" hint="这个版本实际调用的模型。"><select value={versionForm.modelId} onChange={(e) => { const modelId = e.target.value; const model = models.find((item) => String(item.id) === modelId); setVersionForm({ ...versionForm, modelId, providerId: model ? String(model.providerId) : versionForm.providerId }); }}><option value="">请选择 Model</option>{versionModels.map((item) => <option value={item.id} key={item.id}>{item.displayName}{versionForm.providerId ? '' : ` · ${providers.find((provider) => provider.id === item.providerId)?.name ?? ''}`}</option>)}</select></Field>
-        <Field label="版本" hint="新的版本号，需要和已有版本区分，例如 v2。留空会保存为 v1。"><input value={versionForm.version} onChange={(e) => setVersionForm({ ...versionForm, version: e.target.value })} placeholder="v2" /></Field>
-        <Field label="角色" hint="这个版本担任的角色。留空会使用 Agent 名称。"><input value={versionForm.role} onChange={(e) => setVersionForm({ ...versionForm, role: e.target.value })} placeholder="例如审查者" /></Field>
-        <Field label="使命" hint="这个版本的任务说明。可以留空。"><input value={versionForm.mission} onChange={(e) => setVersionForm({ ...versionForm, mission: e.target.value })} placeholder="例如检查改动是否可合并" /></Field>
-        <div className="run-controls"><button>创建版本</button><button type="button" onClick={() => setCreateDialog(null)}>取消</button></div>
-      </form>
-    </Modal> : null}
-    {agentDraft ? <Modal title="编辑 Agent" onClose={() => setAgentDraft(null)}>
-      <form className="form" onSubmit={saveAgent}>
-        <Field label="名称" hint="当前项目里这个 Agent 的名字。"><input value={agentDraft.name} onChange={(e) => setAgentDraft({ ...agentDraft, name: e.target.value })} /></Field>
-        <CapabilityPicker label="能力" hint="从下拉里添加这个 Agent 能承接的能力。目录在「能力」页面维护。" options={capabilities} selected={agentDraft.capabilities} onChange={(next) => setAgentDraft({ ...agentDraft, capabilities: next })} />
-        <SkillPicker label="Skill" hint="勾选后执行时会开启对应工具，并把 Skill 说明交给 Pi。" options={skills} selected={agentDraft.skills} onChange={(next) => setAgentDraft({ ...agentDraft, skills: next })} />
-        <Field label="Provider" hint="这个版本要使用的厂商。"><select value={agentDraft.providerId} onChange={(e) => { const providerId = e.target.value; const stillValid = models.some((item) => String(item.id) === agentDraft.modelId && String(item.providerId) === providerId); setAgentDraft({ ...agentDraft, providerId, modelId: providerId && !stillValid ? '' : agentDraft.modelId }); }}>{providers.map((item) => <option value={item.id} key={item.id}>{item.name} · {item.type}</option>)}</select></Field>
-        <Field label="Model" hint="这个版本实际调用的模型。"><select value={agentDraft.modelId} onChange={(e) => { const modelId = e.target.value; const model = models.find((item) => String(item.id) === modelId); setAgentDraft({ ...agentDraft, modelId, providerId: model ? String(model.providerId) : agentDraft.providerId }); }}><option value="">请选择 Model</option>{models.filter((item) => !agentDraft.providerId || String(item.providerId) === agentDraft.providerId).map((item) => <option value={item.id} key={item.id}>{item.displayName}</option>)}</select></Field>
-        <Field label="版本" hint="正在修改的是最新一个版本。改版本号时不要和已有版本重复。"><input value={agentDraft.version} onChange={(e) => setAgentDraft({ ...agentDraft, version: e.target.value })} /></Field>
-        <Field label="角色" hint="这个版本担任的角色。"><input value={agentDraft.role} onChange={(e) => setAgentDraft({ ...agentDraft, role: e.target.value })} /></Field>
-        <Field label="使命" hint="执行时作为补充提示。可以留空。"><input value={agentDraft.mission} onChange={(e) => setAgentDraft({ ...agentDraft, mission: e.target.value })} /></Field>
-        <div className="run-controls"><button type="submit">保存</button><button type="button" onClick={() => setAgentDraft(null)}>取消</button></div>
-      </form>
-    </Modal> : null}
-  </div>;
-
   const skillsView = <div className="view-stack">
     <SectionTitle title="Skill 目录" action={<button type="button" onClick={() => { setSkillUpload(null); setSkillDialog(true); }}>新增自定义 Skill</button>} />
-    <p className="muted">租户级 Skill，创建 Agent / 节点时可勾选。支持粘贴 SKILL.md，或导入含 scripts 的 zip Skill 包。自定义包统一放在本机 ~/.orvia/skills/ 下，按标识分目录，方便查找维护。系统内置不可删除。</p>
+    <p className="muted">租户级 Skill，Workflow 节点可勾选。支持粘贴 SKILL.md，或导入含 scripts 的 zip Skill 包。自定义包统一放在本机 ~/.orvia/skills/ 下，按标识分目录，方便查找维护。系统内置不可删除。</p>
     <section className="panel"><h3>已有 Skill</h3>{skills.length ? skills.map((item) => {
       const tools = toolsAllowText(item.toolsJson);
       const isBuiltin = item.kind === 'builtin';
@@ -1777,7 +1627,7 @@ export default function ControlCenter() {
     {board && workflowId ? <WorkflowBoard key={workflowId} mode={board} name={workflowForm.name} version={workflowForm.version} versions={workflowVersions} currentVersionId={currentVersionId} nodes={workflowNodesForm} edges={workflowEdgesForm} loops={workflowLoops} capabilities={capabilities} skills={skills} providers={providers} models={models} events={boardEvents} progress={liveProgress ?? nodeProgress(runDetail?.tasks)} failures={liveFailures ?? nodeFailures(runDetail?.tasks)} checks={liveChecks ?? nodeChecks(runDetail?.tasks, boardEvents)} deliverables={liveDeliverables ?? nodeDeliverables(runDetail?.tasks)} reviewHistories={nodeReviewHistories(runDetail?.tasks)} runStatus={runDetail ? statusText(runDetail.status) : '未运行'} runStatusCode={runDetail?.status} onClose={() => void closeBoard()} onName={(name) => setWorkflowForm({ ...workflowForm, name })} onSelectVersion={(versionId) => void requestVersionSwitch(versionId)} onNodes={setWorkflowNodesForm} onEdges={setWorkflowEdgesForm} onLoops={setWorkflowLoops} onPersist={persistBoard} onPublish={() => void publishWorkflow()} onExecute={() => void runAction('execute')} onStop={stopRun} directory={workflowDirectory} decisions={decisions.filter((item) => item.workflowRunId === runId && item.status !== 'superseded')} decisionNotes={decisionText} onDecisionNote={(id, text) => setDecisionText({ ...decisionText, [id]: text })} onResolveDecision={(id, action, options) => void resolveDecision(id, action, options)} onOpenDirectory={async () => { if (!workflowId) return; try { const opened = await request<{ root: string }>(`/api/workflows/${workflowId}/open`, {}); setWorkflowDirectory(opened.root); setNotice('已在访达中打开主目录'); } catch (cause) { fail(cause, '目录打开失败'); } }} onOpenDeliverable={async (directory) => { if (!workflowId) return; try { await request(`/api/workflows/${workflowId}/open`, { directory }); setNotice('已在访达中打开交付物目录'); } catch (cause) { fail(cause, '目录打开失败'); } }} onLoadSummary={async () => { if (!runId) throw new Error('还没有执行记录'); return request<{ nodes: SummaryNode[] }>(`/api/workflow-runs/${runId}/summary`); }} onReadFile={async (filePath) => { if (!workflowId) throw new Error('请先打开 Workflow'); return request<{ name: string; text?: string; binary?: boolean; path?: string }>(`/api/workflows/${workflowId}/file?path=${encodeURIComponent(filePath)}`); }} onListFiles={() => request<{ directory: string; files: { name: string; size: number }[] }>(`/api/workflows/${workflowId}/files`)} onUploadFile={async (file) => { const response = await fetch(`${API_URL}/api/workflows/${workflowId}/files`, { method: 'POST', headers: { ...authHeaders(), 'x-orvia-filename': encodeURIComponent(file.name) }, body: file }); if (!response.ok) { const data = await response.json().catch(() => ({})) as { error?: string }; throw new Error(data.error ?? '上传失败'); } }} onDeleteFile={(name) => request(`/api/workflows/${workflowId}/files?name=${encodeURIComponent(name)}`, undefined, 'DELETE').then(() => undefined)} chatNode={chatNodeKey ? workflowNodesForm.find((node) => node.key === chatNodeKey) ?? null : null} chatMessages={nodeMessages} chatError={chatError} onOpenChat={(key) => { setChatError(''); setChatNodeKey(key); }} onCloseChat={() => { setChatNodeKey(null); setChatError(''); }} onSendChat={sendNodeChat} onStopChat={stopNodeChat} /> : null}
   </div>;
 
-  const views: Record<View, React.ReactNode> = { overview, models: modelsView, agents: agentsView, capabilities: capabilitiesView, skills: skillsView, workflows: workflowsView, settings: settingsView };
+  const views: Record<View, React.ReactNode> = { overview, models: modelsView, capabilities: capabilitiesView, skills: skillsView, workflows: workflowsView, settings: settingsView };
 
   return <main className="app-shell">
     <aside className="sidebar"><div className="brand"><span>O</span><div><strong>ORVIA</strong></div></div><nav aria-label="主导航">{NAV.map((item) => <button key={item.id} className={view === item.id ? 'active' : ''} onClick={() => setView(item.id)}><i>{item.icon}</i>{item.label}{item.id === 'workflows' && pendingDecisions.length > 0 && <em>{pendingDecisions.length}</em>}</button>)}</nav></aside>
