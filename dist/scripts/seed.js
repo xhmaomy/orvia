@@ -1,13 +1,15 @@
 import { asc, eq } from 'drizzle-orm';
 import { db, pool } from '../db/client.js';
 import { ensureTables, repairSchema } from '../db/ensure-schema.js';
-import { agentVersions, agents, budgets, modelProviders, models, projects, workflowEdges, workflowNodes, workflows, } from '../db/schema.js';
+import { bootstrapTenancy } from '../application/tenancy.js';
+import { agentVersions, agents, modelProviders, models, projects, workflowEdges, workflowNodes, workflows, } from '../db/schema.js';
 async function seed() {
     await ensureTables();
     await repairSchema();
+    const { tenantId } = await bootstrapTenancy();
     let project = (await db.select().from(projects).where(eq(projects.name, 'Orvia Revision 3 Demo')).limit(1))[0];
     if (!project) {
-        const result = await db.insert(projects).values({ name: 'Orvia Revision 3 Demo', description: 'Full MVP Golden Path demo' });
+        const result = await db.insert(projects).values({ tenantId, name: 'Orvia Revision 3 Demo', description: 'Full MVP Golden Path demo' });
         project = (await db.select().from(projects).where(eq(projects.id, result[0].insertId)))[0];
     }
     let provider = (await db.select().from(modelProviders).where(eq(modelProviders.name, 'Demo Provider')).limit(1))[0];
@@ -44,12 +46,19 @@ async function seed() {
             definitionJson: { description: 'Plan, execute, then wait for human approval.' },
         });
         workflow = (await db.select().from(workflows).where(eq(workflows.id, result[0].insertId)))[0];
-        const planning = await db.insert(workflowNodes).values({ workflowId: workflow.id, name: 'Plan', capability: 'planning', nodeType: 'task' });
-        const implementation = await db.insert(workflowNodes).values({ workflowId: workflow.id, name: 'Implement', capability: 'code_generation', skill: 'typescript', nodeType: 'task' });
+        const planning = await db.insert(workflowNodes).values({ workflowId: workflow.id, name: 'Plan', capability: 'planning', capabilitiesJson: ['planning'], nodeType: 'task' });
+        const implementation = await db.insert(workflowNodes).values({
+            workflowId: workflow.id,
+            name: 'Implement',
+            capability: 'code_generation',
+            capabilitiesJson: ['code_generation', 'typescript'],
+            nodeType: 'task',
+        });
         const review = await db.insert(workflowNodes).values({
             workflowId: workflow.id,
             name: 'Human approval',
-            capability: 'human_review',
+            capability: '',
+            capabilitiesJson: [],
             nodeType: 'checkpoint',
             configJson: { question: 'Approve the generated artifact?' },
         });
@@ -58,9 +67,6 @@ async function seed() {
             { workflowId: workflow.id, sourceNodeId: implementation[0].insertId, targetNodeId: review[0].insertId },
         ]);
     }
-    const budget = (await db.select().from(budgets).where(eq(budgets.projectId, project.id)).limit(1))[0];
-    if (!budget)
-        await db.insert(budgets).values({ projectId: project.id, limitUnits: 100 });
     console.log(JSON.stringify({ projectId: project.id, agentId: agent.id, workflowId: workflow.id }, null, 2));
 }
 seed().finally(() => pool.end());

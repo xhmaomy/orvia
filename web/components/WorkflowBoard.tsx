@@ -387,8 +387,8 @@ function ChatTurn({ message, fold }: { message: { id: number; role: string; cont
 export type WorkflowVersionOption = { id: number; version: string; seq: number; name: string; publishedAt?: string };
 
 export function WorkflowBoard({
-  mode, name, version, versions, currentVersionId, nodes, edges, loops, capabilities, skills, providers, models, events, progress, failures, checks, deliverables, reviewHistories, directory, runStatus, runStatusCode,
-  onClose, onName, onSelectVersion, onNodes, onEdges, onLoops, onPersist, onPublish, onExecute, onStop, onOpenDirectory, onOpenDeliverable, onLoadSummary, onReadFile, onListFiles, onUploadFile, onDeleteFile,
+  mode, name, version, versions, currentVersionId, nodes, edges, loops, capabilities, skills, providers, models, events, progress, failures, checks, deliverables, reviewHistories, directory, runStatus, runStatusCode, dirty,
+  onClose, onName, onSelectVersion, onNodes, onEdges, onLoops, onPersist, onPublish, onSave, onExecute, onStop, onOpenDirectory, onOpenDeliverable, onLoadSummary, onReadFile, onListFiles, onUploadFile, onDeleteFile,
   decisions, decisionNotes, onDecisionNote, onResolveDecision,
   chatNode, chatMessages, chatError, onOpenChat, onCloseChat, onSendChat, onStopChat,
 }: {
@@ -413,6 +413,8 @@ export function WorkflowBoard({
   directory: string;
   runStatus?: string;
   runStatusCode?: string;
+  /** 画布内容与已发布版本不一致：还有没发布的修改 */
+  dirty?: boolean;
   onClose: () => void;
   onName: (value: string) => void;
   onSelectVersion: (versionId: number) => void;
@@ -421,6 +423,7 @@ export function WorkflowBoard({
   onLoops: (loops: BoardLoop[]) => void;
   onPersist: (nodes: BoardNode[], edges: BoardEdge[], silent?: boolean, loops?: BoardLoop[]) => Promise<boolean>;
   onPublish: () => void;
+  onSave?: () => void;
   onExecute: () => void;
   onStop: () => Promise<boolean>;
   decisions?: BoardDecision[];
@@ -937,12 +940,14 @@ export function WorkflowBoard({
       )}</label>
       <label className="board-root">主目录<button type="button" title={directory || '打开主目录'} onClick={() => void onOpenDirectory()}>{directory || '打开主目录'}</button></label>
       <div className="run-controls board-bar-actions">
+        {onSave ? <button type="button" onClick={() => { if (!guardEdit()) return; onSave(); }} disabled={running}>{currentVersionId ? '保存' : '保存草稿'}</button> : null}
         <button type="button" onClick={() => { if (!guardEdit()) return; onPublish(); }} disabled={running}>{editable ? '发布 Workflow' : '发布'}</button>
         <button type="button" onClick={() => void (async () => {
           if (canEdit) await onPersist(nodesRef.current, edgesRef.current, true);
           onClose();
         })()}>返回列表</button>
       </div>
+      {currentVersionId ? (dirty ? <span className="board-dirty">有未发布的修改</span> : <span className="board-dirty clean">与当前版本一致</span>) : <span className="board-dirty">尚未发布</span>}
     </header>
     <div className={`board-body${chatNode ? ' with-chat' : ''}`} style={{ '--chat-width': `${chatWidth}px` } as CSSProperties}>
       <div className="board-stage">
@@ -1221,12 +1226,12 @@ export function WorkflowBoard({
             const providerId = event.target.value;
             const stillValid = models.some((item) => String(item.id) === editor.modelId && String(item.providerId) === providerId);
             setEditor({ ...editor, providerId, modelId: providerId && !stillValid ? '' : editor.modelId });
-          }}><option value="">请选择 Provider</option>{providers.map((item) => <option value={item.id} key={item.id}>{item.name} · {item.type}</option>)}</select><small className="field-hint">从「模型管理」里已建好的厂商中选择。开始/结束节点不需要模型。</small></label>
+          }}><option value="">请选择 Provider</option>{providers.map((item) => <option value={item.id} key={item.id}>{item.name} · {item.type}</option>)}</select><small className="field-hint">先选厂商，Model 会按厂商过滤。</small></label>
           <label>Model<select value={editor.modelId} onChange={(event) => {
             const modelId = event.target.value;
             const model = models.find((item) => String(item.id) === modelId);
             setEditor({ ...editor, modelId, providerId: model ? String(model.providerId) : editor.providerId });
-          }}><option value="">请选择 Model</option>{(editor.providerId ? models.filter((item) => String(item.providerId) === editor.providerId) : models).map((item) => <option value={item.id} key={item.id}>{item.displayName}{editor.providerId ? '' : ` · ${providers.find((provider) => provider.id === item.providerId)?.name ?? ''}`}</option>)}</select><small className="field-hint">必选。执行和对话时会把这个模型传给 Pi。</small></label>
+          }}><option value="">请选择 Model</option>{models.filter((item) => !editor.providerId || String(item.providerId) === editor.providerId).map((item) => <option value={item.id} key={item.id}>{item.displayName} · {providers.find((provider) => provider.id === item.providerId)?.name ?? '未知厂商'}</option>)}</select><small className="field-hint">必选。执行和对话时会把这个模型传给 Pi。</small></label>
           {!providers.length || !models.length ? <p className="alert">还没有可用模型。请先到「模型管理」创建 Provider 和 Model。</p> : null}
         </> : null}
         {editor.type === 'task' ? <label>任务说明<textarea value={editor.instruction} onChange={(event) => setEditor({ ...editor, instruction: event.target.value })} placeholder="这个 Agent 每次要做的事，例如根据上游 Agent 的产出整理范围" /></label> : null}

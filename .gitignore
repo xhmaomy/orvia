@@ -5,3 +5,5 @@ web/.next/
 dist/
 .DS_Store
 *.log
+.idea/
+.cursor/

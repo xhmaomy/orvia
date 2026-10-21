@@ -956,8 +956,11 @@ async function runInput(workflowRunId: number): Promise<Record<string, unknown>>
 }
 
 async function managedWorkflowRoot(workflowId: number): Promise<string> {
-  const workflow = (await db.select({ name: workflows.name }).from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
-  const resolved = await resolveWorkflowRoot(workflowId, workflow?.name ?? '');
+  const workflow = (await db.select({ name: workflows.name, projectId: workflows.projectId }).from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
+  const project = workflow
+    ? (await db.select({ name: projects.name }).from(projects).where(eq(projects.id, workflow.projectId)).limit(1))[0]
+    : undefined;
+  const resolved = await resolveWorkflowRoot(workflowId, workflow?.name ?? '', project?.name ?? '');
   for (const move of resolved.moves) await rewriteStoredPaths(move.workflowId, move.from, move.to);
   return resolved.root;
 }
@@ -2939,7 +2942,7 @@ async function handler(request: IncomingMessage, response: ServerResponse) {
           redis: { status: redis.status(), url: redisDisplayUrl() },
           runtime: 'pi',
           auth: config.apiToken ? 'required' : 'open',
-          version: '0.1.0-revision3',
+          version: '0.1.0-v3.1',
         };
         return sendJson(response, schemaIssues.length > 0 || redis.status() !== 'ok' ? 503 : 200, payload);
       } catch (error) {
