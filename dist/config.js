@@ -20,4 +20,7 @@ export const config = {
     piCommand: process.env.PI_COMMAND ?? 'pi',
     apiToken,
     maxBodyBytes: 1_000_000,
+    redisUrl: process.env.REDIS_URL ?? 'redis://127.0.0.1:6379',
+    bootstrapEmail: (process.env.ORVIA_BOOTSTRAP_EMAIL ?? 'admin@local.orvia').trim().toLowerCase(),
+    bootstrapPassword: process.env.ORVIA_BOOTSTRAP_PASSWORD ?? 'orvia-local',
 };

@@ -1,8 +1,8 @@
 import './globals.css';
 
 export const metadata = {
-  title: 'Orvia Revision 3 · Control Center',
-  description: 'Orvia Revision 3 多 Agent 协作控制中心',
+  title: 'Orvia v3.1 · Control Center',
+  description: 'Orvia v3.1 多 Agent 协作控制中心',
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

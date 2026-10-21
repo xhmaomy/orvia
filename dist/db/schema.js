@@ -1,8 +1,40 @@
-import { datetime, int, json, mysqlEnum, mysqlTable, text, timestamp, uniqueIndex, varchar, } from 'drizzle-orm/mysql-core';
+import { datetime, index, int, json, mysqlEnum, mysqlTable, text, timestamp, uniqueIndex, varchar, } from 'drizzle-orm/mysql-core';
 import { sql } from 'drizzle-orm';
 const status = mysqlEnum('status', ['active', 'inactive', 'draft', 'published', 'archived']);
+const memberRole = mysqlEnum('member_role', ['owner', 'admin', 'member']);
+export const tenants = mysqlTable('ov_tenants', {
+    id: int('id').autoincrement().primaryKey(),
+    name: varchar('name', { length: 160 }).notNull(),
+    slug: varchar('slug', { length: 80 }).notNull(),
+    status: status.notNull().default('active'),
+    createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
+    updatedAt: timestamp('updated_at').default(sql `CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
+}, (table) => ({
+    slugUnique: uniqueIndex('tenants_slug_unique').on(table.slug),
+}));
+export const users = mysqlTable('ov_users', {
+    id: int('id').autoincrement().primaryKey(),
+    email: varchar('email', { length: 190 }).notNull(),
+    name: varchar('name', { length: 160 }).notNull(),
+    passwordHash: varchar('password_hash', { length: 255 }).notNull(),
+    status: status.notNull().default('active'),
+    createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
+    updatedAt: timestamp('updated_at').default(sql `CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
+}, (table) => ({
+    emailUnique: uniqueIndex('users_email_unique').on(table.email),
+}));
+export const tenantMembers = mysqlTable('ov_tenant_members', {
+    id: int('id').autoincrement().primaryKey(),
+    tenantId: int('tenant_id').notNull().references(() => tenants.id),
+    userId: int('user_id').notNull().references(() => users.id),
+    role: memberRole.notNull().default('member'),
+    createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
+}, (table) => ({
+    membershipUnique: uniqueIndex('tenant_members_unique').on(table.tenantId, table.userId),
+}));
 export const projects = mysqlTable('ov_projects', {
     id: int('id').autoincrement().primaryKey(),
+    tenantId: int('tenant_id').references(() => tenants.id),
     name: varchar('name', { length: 160 }).notNull(),
     description: text('description'),
     status: status.notNull().default('active'),
@@ -36,15 +68,46 @@ export const models = mysqlTable('ov_models', {
 }, (table) => ({
     providerModelUnique: uniqueIndex('models_provider_name_unique').on(table.providerId, table.name),
 }));
+export const capabilities = mysqlTable('ov_capabilities', {
+    id: int('id').autoincrement().primaryKey(),
+    tenantId: int('tenant_id').notNull().references(() => tenants.id),
+    key: varchar('capability_key', { length: 120 }).notNull(),
+    name: varchar('name', { length: 160 }).notNull(),
+    description: text('description'),
+    createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
+    updatedAt: timestamp('updated_at').default(sql `CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
+}, (table) => ({
+    tenantKeyUnique: uniqueIndex('capabilities_tenant_key_unique').on(table.tenantId, table.key),
+}));
+export const skills = mysqlTable('ov_skills', {
+    id: int('id').autoincrement().primaryKey(),
+    tenantId: int('tenant_id').notNull().references(() => tenants.id),
+    key: varchar('skill_key', { length: 120 }).notNull(),
+    name: varchar('name', { length: 160 }).notNull(),
+    description: text('description'),
+    kind: mysqlEnum('skill_kind', ['builtin', 'custom']).notNull().default('custom'),
+    toolsJson: json('tools_json'),
+    contentMd: text('content_md'),
+    configJson: json('config_json'),
+    status: status.notNull().default('active'),
+    createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
+    updatedAt: timestamp('updated_at').default(sql `CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
+}, (table) => ({
+    tenantKeyUnique: uniqueIndex('skills_tenant_key_unique').on(table.tenantId, table.key),
+}));
 export const agents = mysqlTable('ov_agents', {
     id: int('id').autoincrement().primaryKey(),
     projectId: int('project_id').notNull().references(() => projects.id),
+    workflowId: int('workflow_id').references(() => workflows.id),
     name: varchar('name', { length: 160 }).notNull(),
     description: text('description'),
     capabilitiesJson: json('capabilities_json'),
+    skillsJson: json('skills_json'),
     createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
     updatedAt: timestamp('updated_at').default(sql `CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
-});
+}, (table) => ({
+    workflowIdx: index('agents_workflow_id_idx').on(table.workflowId),
+}));
 export const agentVersions = mysqlTable('ov_agent_versions', {
     id: int('id').autoincrement().primaryKey(),
     agentId: int('agent_id').notNull().references(() => agents.id),
@@ -63,18 +126,33 @@ export const workflows = mysqlTable('ov_workflows', {
     projectId: int('project_id').notNull().references(() => projects.id),
     name: varchar('name', { length: 160 }).notNull(),
     version: varchar('version', { length: 40 }).notNull(),
+    currentVersionId: int('current_version_id'),
     definitionJson: json('definition_json'),
     status: status.notNull().default('draft'),
+    runStatus: mysqlEnum('run_status', ['pending', 'running', 'paused', 'awaiting_decision', 'completed', 'failed', 'cancelled']),
     createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
     updatedAt: timestamp('updated_at').default(sql `CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
 });
+export const workflowVersions = mysqlTable('ov_workflow_versions', {
+    id: int('id').autoincrement().primaryKey(),
+    workflowId: int('workflow_id').notNull().references(() => workflows.id),
+    version: varchar('version', { length: 40 }).notNull(),
+    seq: int('seq').notNull(),
+    name: varchar('name', { length: 160 }).notNull(),
+    definitionJson: json('definition_json').notNull(),
+    publishedAt: timestamp('published_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
+}, (table) => ({
+    versionUnique: uniqueIndex('workflow_versions_workflow_version_unique').on(table.workflowId, table.version),
+    seqUnique: uniqueIndex('workflow_versions_workflow_seq_unique').on(table.workflowId, table.seq),
+}));
 export const workflowNodes = mysqlTable('ov_workflow_nodes', {
     id: int('id').autoincrement().primaryKey(),
     workflowId: int('workflow_id').notNull().references(() => workflows.id),
     name: varchar('name', { length: 160 }).notNull(),
     capability: varchar('capability', { length: 120 }).notNull(),
     skill: varchar('skill', { length: 120 }),
-    nodeType: mysqlEnum('node_type', ['task', 'checkpoint']).notNull().default('task'),
+    capabilitiesJson: json('capabilities_json'),
+    nodeType: mysqlEnum('node_type', ['task', 'checkpoint', 'start', 'end']).notNull().default('task'),
     configJson: json('config_json'),
 });
 export const workflowEdges = mysqlTable('ov_workflow_edges', {
@@ -89,6 +167,7 @@ export const workflowEdges = mysqlTable('ov_workflow_edges', {
 export const workflowRuns = mysqlTable('ov_workflow_runs', {
     id: int('id').autoincrement().primaryKey(),
     workflowId: int('workflow_id').notNull().references(() => workflows.id),
+    workflowVersionId: int('workflow_version_id'),
     status: mysqlEnum('run_status', ['pending', 'running', 'paused', 'awaiting_decision', 'completed', 'failed', 'cancelled']).notNull().default('pending'),
     currentPlanVersion: int('current_plan_version').notNull().default(1),
     idempotencyKey: varchar('idempotency_key', { length: 160 }),
@@ -98,6 +177,7 @@ export const workflowRuns = mysqlTable('ov_workflow_runs', {
     completedAt: datetime('completed_at'),
     createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
 }, (table) => ({
+    workflowUnique: uniqueIndex('workflow_runs_workflow_unique').on(table.workflowId),
     idempotencyUnique: uniqueIndex('workflow_runs_idempotency_unique').on(table.idempotencyKey),
 }));
 export const plans = mysqlTable('ov_plans', {
@@ -154,102 +234,35 @@ export const checkpoints = mysqlTable('ov_checkpoints', {
     createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
     resolvedAt: datetime('resolved_at'),
 });
-export const artifacts = mysqlTable('ov_artifacts', {
+export const nodeMessages = mysqlTable('ov_node_messages', {
     id: int('id').autoincrement().primaryKey(),
-    projectId: int('project_id').notNull().references(() => projects.id),
-    workflowRunId: int('workflow_run_id').references(() => workflowRuns.id),
-    taskId: int('task_id').references(() => tasks.id),
+    workflowId: int('workflow_id').notNull().references(() => workflows.id),
+    workflowVersionId: int('workflow_version_id'),
+    nodeKey: varchar('node_key', { length: 160 }).notNull(),
     sessionId: int('session_id').references(() => sessions.id),
-    name: varchar('name', { length: 240 }).notNull(),
-    kind: varchar('kind', { length: 80 }).notNull().default('text'),
-    status: mysqlEnum('artifact_status', ['draft', 'ready', 'approved', 'rejected', 'archived']).notNull().default('ready'),
-    currentVersion: int('current_version').notNull().default(1),
-    metadataJson: json('metadata_json'),
-    createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
-    updatedAt: timestamp('updated_at').default(sql `CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
-});
-export const artifactVersions = mysqlTable('ov_artifact_versions', {
-    id: int('id').autoincrement().primaryKey(),
-    artifactId: int('artifact_id').notNull().references(() => artifacts.id),
-    version: int('version').notNull(),
+    role: mysqlEnum('node_message_role', ['user', 'assistant']).notNull(),
     content: text('content').notNull(),
-    mimeType: varchar('mime_type', { length: 120 }).notNull().default('text/plain'),
-    createdBy: varchar('created_by', { length: 80 }).notNull().default('agent'),
+    thinking: text('thinking'),
+    status: mysqlEnum('node_message_status', ['pending', 'streaming', 'completed', 'failed']).notNull().default('completed'),
     createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
 }, (table) => ({
-    artifactVersionUnique: uniqueIndex('artifact_versions_unique').on(table.artifactId, table.version),
+    workflowNodeKey: index('node_messages_workflow_key').on(table.workflowId, table.nodeKey),
+    nodeMessagesVersionIdx: index('node_messages_version_idx').on(table.workflowVersionId),
 }));
-export const memories = mysqlTable('ov_memories', {
-    id: int('id').autoincrement().primaryKey(),
-    projectId: int('project_id').notNull().references(() => projects.id),
-    agentId: int('agent_id').references(() => agents.id),
-    scope: mysqlEnum('memory_scope', ['project', 'agent']).notNull().default('project'),
-    key: varchar('memory_key', { length: 180 }).notNull(),
-    content: text('content').notNull(),
-    metadataJson: json('metadata_json'),
-    createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
-    updatedAt: timestamp('updated_at').default(sql `CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
-});
-export const chatThreads = mysqlTable('ov_chat_threads', {
-    id: int('id').autoincrement().primaryKey(),
-    projectId: int('project_id').notNull().references(() => projects.id),
-    agentId: int('agent_id').notNull().references(() => agents.id),
-    title: varchar('title', { length: 200 }).notNull(),
-    status: mysqlEnum('chat_status', ['active', 'archived']).notNull().default('active'),
-    createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
-    updatedAt: timestamp('updated_at').default(sql `CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
-});
-export const chatMessages = mysqlTable('ov_chat_messages', {
-    id: int('id').autoincrement().primaryKey(),
-    threadId: int('thread_id').notNull().references(() => chatThreads.id),
-    sessionId: int('session_id').references(() => sessions.id),
-    role: mysqlEnum('chat_role', ['user', 'assistant', 'system']).notNull(),
-    content: text('content').notNull(),
-    status: mysqlEnum('message_status', ['pending', 'streaming', 'completed', 'failed']).notNull().default('completed'),
-    metadataJson: json('metadata_json'),
-    createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
-});
-export const permissionPolicies = mysqlTable('ov_permission_policies', {
-    id: int('id').autoincrement().primaryKey(),
-    projectId: int('project_id').notNull().references(() => projects.id),
-    agentId: int('agent_id').references(() => agents.id),
-    name: varchar('name', { length: 160 }).notNull(),
-    rulesJson: json('rules_json').notNull(),
-    status: status.notNull().default('active'),
-    createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
-    updatedAt: timestamp('updated_at').default(sql `CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
-});
-export const budgets = mysqlTable('ov_budgets', {
-    id: int('id').autoincrement().primaryKey(),
-    projectId: int('project_id').notNull().references(() => projects.id),
-    workflowRunId: int('workflow_run_id').references(() => workflowRuns.id),
-    limitUnits: int('limit_units').notNull(),
-    usedUnits: int('used_units').notNull().default(0),
-    status: mysqlEnum('budget_status', ['active', 'exhausted', 'closed']).notNull().default('active'),
-    createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
-    updatedAt: timestamp('updated_at').default(sql `CURRENT_TIMESTAMP`).onUpdateNow().notNull(),
-});
-export const usageRecords = mysqlTable('ov_usage_records', {
-    id: int('id').autoincrement().primaryKey(),
-    budgetId: int('budget_id').references(() => budgets.id),
-    workflowRunId: int('workflow_run_id').references(() => workflowRuns.id),
-    taskId: int('task_id').references(() => tasks.id),
-    agentId: int('agent_id').references(() => agents.id),
-    units: int('units').notNull().default(1),
-    metadataJson: json('metadata_json'),
-    createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
-});
 export const events = mysqlTable('ov_events', {
     id: int('id').autoincrement().primaryKey(),
     projectId: int('project_id').notNull().references(() => projects.id),
     workflowRunId: int('workflow_run_id').references(() => workflowRuns.id),
+    workflowVersionId: int('workflow_version_id'),
     taskId: int('task_id').references(() => tasks.id),
     sessionId: int('session_id').references(() => sessions.id),
     agentId: int('agent_id').references(() => agents.id),
     type: varchar('type', { length: 120 }).notNull(),
     payloadJson: json('payload_json'),
     createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),
-});
+}, (table) => ({
+    eventsVersionIdx: index('events_version_idx').on(table.workflowVersionId),
+}));
 export const decisions = mysqlTable('ov_decisions', {
     id: int('id').autoincrement().primaryKey(),
     projectId: int('project_id').notNull().references(() => projects.id),
@@ -258,7 +271,7 @@ export const decisions = mysqlTable('ov_decisions', {
     question: text('question').notNull(),
     decision: text('decision'),
     decidedBy: varchar('decided_by', { length: 80 }).notNull().default('human'),
-    action: mysqlEnum('decision_action', ['approve', 'request_changes', 'reject', 'override', 'replan']),
+    action: mysqlEnum('decision_action', ['approve', 'request_changes', 'reject', 'override', 'replan', 'repeat']),
     status: mysqlEnum('decision_status', ['pending', 'approved', 'changes_requested', 'rejected', 'overridden', 'superseded']).notNull().default('pending'),
     contextJson: json('context_json'),
     createdAt: timestamp('created_at').default(sql `CURRENT_TIMESTAMP`).notNull(),

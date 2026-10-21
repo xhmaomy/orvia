@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { access, mkdir, readdir, readFile, rename, rm, writeFile, copyFile, stat } from 'node:fs/promises';
+import type { Dirent } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -30,16 +31,32 @@ export function sequenceFolderName(base: string, index: number, total: number): 
 
 export type DirectoryMove = { workflowId: number; from: string; to: string };
 
-export async function resolveWorkflowRoot(workflowId: number, name: string, base = MANAGED_ROOT): Promise<{ root: string; moves: DirectoryMove[] }> {
+/** 项目分组目录名：项目名为空时不分组，直接放在 base 下 */
+export function projectFolderName(projectName: string): string {
+  return folderBaseName(projectName, '未分组');
+}
+
+/**
+ * 解析 Workflow 的主目录。
+ *
+ * 目录约定是 `~/.orvia/workflows/{项目名}/{工作流名}/`。已有的目录靠 `.orvia-workflow`
+ * 标记文件认领：只要标记里的 workflowId 对得上就原地保留，所以老 Workflow 继续用老路径，
+ * 项目改名也不会让目录失联。只有认领不到的全新 Workflow 才落到项目分组下。
+ */
+export async function resolveWorkflowRoot(workflowId: number, name: string, projectName = '', base = MANAGED_ROOT): Promise<{ root: string; moves: DirectoryMove[] }> {
   await ensureDirectory(base);
   const preferred = workflowFolderName(name, workflowId);
   let current = await locateWorkflowRoot(workflowId, base);
   if (!current) {
-    current = path.join(base, `.pending-${workflowId}`);
+    // 没有项目名时不分组，保持扁平结构
+    const parent = projectName.trim() ? path.join(base, projectFolderName(projectName)) : base;
+    await ensureDirectory(parent);
+    current = path.join(parent, `.pending-${workflowId}`);
     await ensureDirectory(current);
   }
   await writeFile(path.join(current, WORKFLOW_MARKER), `${workflowId}\n`, 'utf8');
-  const moves = await renumberSequence(base, preferred, workflowId);
+  // 同名序号在所属父目录内编号
+  const moves = await renumberSequence(path.dirname(current), preferred, workflowId);
   const root = await locateWorkflowRoot(workflowId, base);
   if (!root) throw new Error('无法创建 Workflow 目录');
   return { root, moves };
@@ -72,15 +89,43 @@ export async function allocateSequenceFolder(parent: string, baseName: string): 
   return { name: `${baseName}-${total}`, moves };
 }
 
+/**
+ * 在 base 下找这个 Workflow 已有的目录。两层深度：`base/{工作流名}`（老结构）和
+ * `base/{项目名}/{工作流名}`（新结构）。找到就原地返回，不搬动。
+ */
 async function locateWorkflowRoot(workflowId: number, base: string): Promise<string | undefined> {
-  const entries = await readdir(base, { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const directory = path.join(base, entry.name);
+  for (const directory of await candidateWorkflowDirectories(base)) {
     if (await readOwner(directory) === workflowId) return directory;
   }
   const legacy = path.join(base, String(workflowId));
   return await directoryExists(legacy) ? legacy : undefined;
+}
+
+/** base 下的两层候选目录：先是一级，再是二级 */
+async function candidateWorkflowDirectories(base: string): Promise<string[]> {
+  const directories: string[] = [];
+  let entries: Dirent[] = [];
+  try {
+    entries = await readdir(base, { withFileTypes: true });
+  } catch {
+    return directories;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+    const directory = path.join(base, entry.name);
+    directories.push(directory);
+    let children: Dirent[] = [];
+    try {
+      children = await readdir(directory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const child of children) {
+      if (!child.isDirectory() || child.name.startsWith('.')) continue;
+      directories.push(path.join(directory, child.name));
+    }
+  }
+  return directories;
 }
 
 function matchesSequence(folderName: string, base: string): boolean {

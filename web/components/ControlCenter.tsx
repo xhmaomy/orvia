@@ -362,6 +362,7 @@ export default function ControlCenter() {
   const [createDialog, setCreateDialog] = useState<'provider' | 'model' | 'project' | 'workflow' | null>(null);
   const [projectDraft, setProjectDraft] = useState<{ id: Id; name: string } | null>(null);
   const [newWorkflowProjectId, setNewWorkflowProjectId] = useState('');
+  const [newWorkflowName, setNewWorkflowName] = useState('');
   const [workflowProjectFilter, setWorkflowProjectFilter] = useState('');
   const [workflowForm, setWorkflowForm] = useState({ name: '', version: 'v1' });
   const [workflowNodesForm, setWorkflowNodesForm] = useState<WorkflowNodeDraft[]>([]);
@@ -1006,6 +1007,19 @@ export default function ControlCenter() {
     }
     return act('save-node', save, 'Agent 已保存');
   }
+  /** 只保存当前工作副本：不写版本历史、不改版本号。基线保持为已发布版本，「有未发布的修改」才继续显示 */
+  async function saveWorkflowDraft() {
+    await act('workflow-save', async () => {
+      if (!workflowId) throw new Error('请先新建 Workflow');
+      if (!workflowForm.name.trim()) throw new Error('请输入 Workflow 名称');
+      const current = workflows.find((item) => item.id === workflowId);
+      await request(`/api/workflows/${workflowId}`, {
+        name: workflowForm.name.trim() || current?.name || '未命名 Workflow',
+        status: current?.status === 'published' ? 'published' : 'draft',
+        definitionJson: workflowDefinition(),
+      }, 'PATCH');
+    }, '草稿已保存');
+  }
   async function publishWorkflow(silentNotice?: string) {
     const ok = await act('workflow', async () => {
       const id = requireProject();
@@ -1129,6 +1143,7 @@ export default function ControlCenter() {
       return;
     }
     setNewWorkflowProjectId(projectId ? String(projectId) : String(projects[0]!.id));
+    setNewWorkflowName('');
     setCreateDialog('workflow');
   }
   async function createWorkflowDraft(e: FormEvent) {
@@ -1137,9 +1152,11 @@ export default function ControlCenter() {
       const id = Number(newWorkflowProjectId);
       if (!Number.isInteger(id) || id < 1) throw new Error('请选择所属项目');
       if (!projects.some((item) => item.id === id)) throw new Error('所选项目不存在');
+      const name = newWorkflowName.trim();
+      if (!name) throw new Error('请输入 Workflow 名称');
       const created = await request<{ id: Id }>('/api/workflows', {
         projectId: id,
-        name: '未命名 Workflow',
+        name,
         version: 'v1',
         status: 'draft',
         definitionJson: { nodes: [], edges: [] },
@@ -1150,14 +1167,14 @@ export default function ControlCenter() {
       setProjectId(id);
       window.sessionStorage.setItem('orvia.project', String(id));
       setWorkflowId(created.id);
-      setWorkflowForm({ name: '未命名 Workflow', version: '未发布' });
+      setWorkflowForm({ name, version: '未发布' });
       setWorkflowNodesForm(graph.nodes);
       setWorkflowEdgesForm(graph.edges);
       setWorkflowLoops(result.loops ?? []);
       setWorkflowDirectory(result.root ?? '');
       setWorkflowVersions([]);
       setCurrentVersionId(null);
-      setBaselineDefinition(definitionSnapshot(graph.nodes, graph.edges, result.loops ?? [], '未命名 Workflow'));
+      setBaselineDefinition(definitionSnapshot(graph.nodes, graph.edges, result.loops ?? [], name));
       setRuns([]);
       setRunId(null);
       setBoard('create');
@@ -1620,18 +1637,19 @@ export default function ControlCenter() {
     </section>
     {createDialog === 'workflow' ? <Modal title="新建 Workflow" onClose={() => setCreateDialog(null)}>
       <form className="form" onSubmit={(event) => void createWorkflowDraft(event)}>
+        <Field label="名称" hint="这个 Workflow 在画布和产物目录里的名字。"><input value={newWorkflowName} onChange={(e) => setNewWorkflowName(e.target.value)} placeholder="例如产品研发小组" required autoFocus /></Field>
         <Field label="所属项目" hint="这个 Workflow 会归到所选项目下，Overview 的项目列表也会按此统计。"><select value={newWorkflowProjectId} onChange={(e) => setNewWorkflowProjectId(e.target.value)} required><option value="">请选择项目</option>{projects.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></Field>
         <div className="run-controls"><button type="submit">创建并打开</button><button type="button" onClick={() => setCreateDialog(null)}>取消</button></div>
       </form>
     </Modal> : null}
-    {board && workflowId ? <WorkflowBoard key={workflowId} mode={board} name={workflowForm.name} version={workflowForm.version} versions={workflowVersions} currentVersionId={currentVersionId} nodes={workflowNodesForm} edges={workflowEdgesForm} loops={workflowLoops} capabilities={capabilities} skills={skills} providers={providers} models={models} events={boardEvents} progress={liveProgress ?? nodeProgress(runDetail?.tasks)} failures={liveFailures ?? nodeFailures(runDetail?.tasks)} checks={liveChecks ?? nodeChecks(runDetail?.tasks, boardEvents)} deliverables={liveDeliverables ?? nodeDeliverables(runDetail?.tasks)} reviewHistories={nodeReviewHistories(runDetail?.tasks)} runStatus={runDetail ? statusText(runDetail.status) : '未运行'} runStatusCode={runDetail?.status} onClose={() => void closeBoard()} onName={(name) => setWorkflowForm({ ...workflowForm, name })} onSelectVersion={(versionId) => void requestVersionSwitch(versionId)} onNodes={setWorkflowNodesForm} onEdges={setWorkflowEdgesForm} onLoops={setWorkflowLoops} onPersist={persistBoard} onPublish={() => void publishWorkflow()} onExecute={() => void runAction('execute')} onStop={stopRun} directory={workflowDirectory} decisions={decisions.filter((item) => item.workflowRunId === runId && item.status !== 'superseded')} decisionNotes={decisionText} onDecisionNote={(id, text) => setDecisionText({ ...decisionText, [id]: text })} onResolveDecision={(id, action, options) => void resolveDecision(id, action, options)} onOpenDirectory={async () => { if (!workflowId) return; try { const opened = await request<{ root: string }>(`/api/workflows/${workflowId}/open`, {}); setWorkflowDirectory(opened.root); setNotice('已在访达中打开主目录'); } catch (cause) { fail(cause, '目录打开失败'); } }} onOpenDeliverable={async (directory) => { if (!workflowId) return; try { await request(`/api/workflows/${workflowId}/open`, { directory }); setNotice('已在访达中打开交付物目录'); } catch (cause) { fail(cause, '目录打开失败'); } }} onLoadSummary={async () => { if (!runId) throw new Error('还没有执行记录'); return request<{ nodes: SummaryNode[] }>(`/api/workflow-runs/${runId}/summary`); }} onReadFile={async (filePath) => { if (!workflowId) throw new Error('请先打开 Workflow'); return request<{ name: string; text?: string; binary?: boolean; path?: string }>(`/api/workflows/${workflowId}/file?path=${encodeURIComponent(filePath)}`); }} onListFiles={() => request<{ directory: string; files: { name: string; size: number }[] }>(`/api/workflows/${workflowId}/files`)} onUploadFile={async (file) => { const response = await fetch(`${API_URL}/api/workflows/${workflowId}/files`, { method: 'POST', headers: { ...authHeaders(), 'x-orvia-filename': encodeURIComponent(file.name) }, body: file }); if (!response.ok) { const data = await response.json().catch(() => ({})) as { error?: string }; throw new Error(data.error ?? '上传失败'); } }} onDeleteFile={(name) => request(`/api/workflows/${workflowId}/files?name=${encodeURIComponent(name)}`, undefined, 'DELETE').then(() => undefined)} chatNode={chatNodeKey ? workflowNodesForm.find((node) => node.key === chatNodeKey) ?? null : null} chatMessages={nodeMessages} chatError={chatError} onOpenChat={(key) => { setChatError(''); setChatNodeKey(key); }} onCloseChat={() => { setChatNodeKey(null); setChatError(''); }} onSendChat={sendNodeChat} onStopChat={stopNodeChat} /> : null}
+    {board && workflowId ? <WorkflowBoard key={workflowId} mode={board} name={workflowForm.name} version={workflowForm.version} versions={workflowVersions} currentVersionId={currentVersionId} nodes={workflowNodesForm} edges={workflowEdgesForm} loops={workflowLoops} capabilities={capabilities} skills={skills} providers={providers} models={models} events={boardEvents} progress={liveProgress ?? nodeProgress(runDetail?.tasks)} failures={liveFailures ?? nodeFailures(runDetail?.tasks)} checks={liveChecks ?? nodeChecks(runDetail?.tasks, boardEvents)} deliverables={liveDeliverables ?? nodeDeliverables(runDetail?.tasks)} reviewHistories={nodeReviewHistories(runDetail?.tasks)} runStatus={runDetail ? statusText(runDetail.status) : '未运行'} runStatusCode={runDetail?.status} dirty={hasUnpublishedChanges()} onClose={() => void closeBoard()} onName={(name) => setWorkflowForm({ ...workflowForm, name })} onSelectVersion={(versionId) => void requestVersionSwitch(versionId)} onNodes={setWorkflowNodesForm} onEdges={setWorkflowEdgesForm} onLoops={setWorkflowLoops} onPersist={persistBoard} onPublish={() => void publishWorkflow()} onSave={() => void saveWorkflowDraft()} onExecute={() => void runAction('execute')} onStop={stopRun} directory={workflowDirectory} decisions={decisions.filter((item) => item.workflowRunId === runId && item.status !== 'superseded')} decisionNotes={decisionText} onDecisionNote={(id, text) => setDecisionText({ ...decisionText, [id]: text })} onResolveDecision={(id, action, options) => void resolveDecision(id, action, options)} onOpenDirectory={async () => { if (!workflowId) return; try { const opened = await request<{ root: string }>(`/api/workflows/${workflowId}/open`, {}); setWorkflowDirectory(opened.root); setNotice('已在访达中打开主目录'); } catch (cause) { fail(cause, '目录打开失败'); } }} onOpenDeliverable={async (directory) => { if (!workflowId) return; try { await request(`/api/workflows/${workflowId}/open`, { directory }); setNotice('已在访达中打开交付物目录'); } catch (cause) { fail(cause, '目录打开失败'); } }} onLoadSummary={async () => { if (!runId) throw new Error('还没有执行记录'); return request<{ nodes: SummaryNode[] }>(`/api/workflow-runs/${runId}/summary`); }} onReadFile={async (filePath) => { if (!workflowId) throw new Error('请先打开 Workflow'); return request<{ name: string; text?: string; binary?: boolean; path?: string }>(`/api/workflows/${workflowId}/file?path=${encodeURIComponent(filePath)}`); }} onListFiles={() => request<{ directory: string; files: { name: string; size: number }[] }>(`/api/workflows/${workflowId}/files`)} onUploadFile={async (file) => { const response = await fetch(`${API_URL}/api/workflows/${workflowId}/files`, { method: 'POST', headers: { ...authHeaders(), 'x-orvia-filename': encodeURIComponent(file.name) }, body: file }); if (!response.ok) { const data = await response.json().catch(() => ({})) as { error?: string }; throw new Error(data.error ?? '上传失败'); } }} onDeleteFile={(name) => request(`/api/workflows/${workflowId}/files?name=${encodeURIComponent(name)}`, undefined, 'DELETE').then(() => undefined)} chatNode={chatNodeKey ? workflowNodesForm.find((node) => node.key === chatNodeKey) ?? null : null} chatMessages={nodeMessages} chatError={chatError} onOpenChat={(key) => { setChatError(''); setChatNodeKey(key); }} onCloseChat={() => { setChatNodeKey(null); setChatError(''); }} onSendChat={sendNodeChat} onStopChat={stopNodeChat} /> : null}
   </div>;
 
   const views: Record<View, React.ReactNode> = { overview, models: modelsView, capabilities: capabilitiesView, skills: skillsView, workflows: workflowsView, settings: settingsView };
 
   return <main className="app-shell">
     <aside className="sidebar"><div className="brand"><span>O</span><div><strong>ORVIA</strong></div></div><nav aria-label="主导航">{NAV.map((item) => <button key={item.id} className={view === item.id ? 'active' : ''} onClick={() => setView(item.id)}><i>{item.icon}</i>{item.label}{item.id === 'workflows' && pendingDecisions.length > 0 && <em>{pendingDecisions.length}</em>}</button>)}</nav></aside>
-    <div className="workspace"><header className="topbar"><div className="topbar-title">{view === 'overview' ? <><h1>Overview(v3.0)</h1><p className="topbar-desc">Orvia 是多 Agent 协作编排平台，让复杂任务可拆、可并行、可把控。</p></> : <h1>{NAV.find((item) => item.id === view)?.label}</h1>}</div><div className="toolbar"><button className="icon-button" onClick={() => void act('refresh', refresh, '数据已刷新')} aria-label="刷新">↻</button></div></header>
+    <div className="workspace"><header className="topbar"><div className="topbar-title">{view === 'overview' ? <><h1>Overview(v3.1)</h1><p className="topbar-desc">Orvia 是多 Agent 协作编排平台，让复杂任务可拆、可并行、可把控。</p></> : <h1>{NAV.find((item) => item.id === view)?.label}</h1>}</div><div className="toolbar"><button className="icon-button" onClick={() => void act('refresh', refresh, '数据已刷新')} aria-label="刷新">↻</button></div></header>
       <div className="feedback" aria-live="polite">{state === 'loading' && <div className="loading"><i />正在载入数据…</div>}{error && <div className="alert"><b>请求失败</b><span>{error}</span><button onClick={() => setError('')} aria-label="关闭">×</button></div>}{notice && <div className="notice">{notice}<button onClick={() => setNotice('')} aria-label="关闭">×</button></div>}</div>
       <div className="view">{views[view]}</div>
     </div>

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { access, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { allocateSequenceFolder, executionStamp, loopForNode, nodeDirectory, resolveWorkflowRoot, sequenceFolderName, validateLoops, withTerminals, writeTaskBrief } from '../src/application/workflow-workspace.js';
+import { allocateSequenceFolder, directoryExists, executionStamp, loopForNode, nodeDirectory, resolveWorkflowRoot, sequenceFolderName, validateLoops, withTerminals, writeTaskBrief } from '../src/application/workflow-workspace.js';
 
 test('workflow gains a start and an end around the existing chain', () => {
   const graph = withTerminals(
@@ -43,16 +43,48 @@ test('workflow directory uses the workflow name', async () => {
   const base = await mkdtemp(path.join(tmpdir(), 'orvia-workflows-'));
   try {
     await mkdir(path.join(base, '7'));
-    const renamed = await resolveWorkflowRoot(7, '产品研发小组', base);
+    const renamed = await resolveWorkflowRoot(7, '产品研发小组', '', base);
     assert.equal(renamed.root, path.join(base, '产品研发小组'));
-    const same = await resolveWorkflowRoot(7, '产品研发小组', base);
+    const same = await resolveWorkflowRoot(7, '产品研发小组', '', base);
     assert.equal(same.root, renamed.root);
-    const other = await resolveWorkflowRoot(8, '产品研发小组', base);
+    const other = await resolveWorkflowRoot(8, '产品研发小组', '', base);
     assert.equal(other.root, path.join(base, '产品研发小组-2'));
-    const first = await resolveWorkflowRoot(7, '产品研发小组', base);
+    const first = await resolveWorkflowRoot(7, '产品研发小组', '', base);
     assert.equal(first.root, path.join(base, '产品研发小组-1'));
-    const unique = await resolveWorkflowRoot(9, '发布检查', base);
+    const unique = await resolveWorkflowRoot(9, '发布检查', '', base);
     assert.equal(unique.root, path.join(base, '发布检查'));
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('new workflow directory is grouped under the project folder', async () => {
+  const base = await mkdtemp(path.join(tmpdir(), 'orvia-workflows-'));
+  try {
+    const created = await resolveWorkflowRoot(1, '产品研发小组', '智能终端', base);
+    assert.equal(created.root, path.join(base, '智能终端', '产品研发小组'));
+    // 同项目下同名再开一个，序号在项目目录内编号
+    const second = await resolveWorkflowRoot(2, '产品研发小组', '智能终端', base);
+    assert.equal(second.root, path.join(base, '智能终端', '产品研发小组-2'));
+    // 另一个项目下同名，互不干扰
+    const other = await resolveWorkflowRoot(3, '产品研发小组', '云平台', base);
+    assert.equal(other.root, path.join(base, '云平台', '产品研发小组'));
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('existing workflow directory stays where it is after project grouping lands', async () => {
+  const base = await mkdtemp(path.join(tmpdir(), 'orvia-workflows-'));
+  try {
+    // 老结构：目录直接在 base 下面
+    const legacy = path.join(base, '产品研发小组');
+    await mkdir(legacy, { recursive: true });
+    await writeFile(path.join(legacy, '.orvia-workflow'), '5\n', 'utf8');
+    const kept = await resolveWorkflowRoot(5, '产品研发小组', '智能终端', base);
+    assert.equal(kept.root, legacy);
+    // 目录没有被搬进项目分组
+    assert.equal(await directoryExists(path.join(base, '智能终端')), false);
   } finally {
     await rm(base, { recursive: true, force: true });
   }

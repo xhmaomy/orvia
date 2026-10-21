@@ -1,13 +1,59 @@
 import { pool } from './client.js';
 const statements = [
+    `CREATE TABLE IF NOT EXISTS ov_tenants (
+    id int NOT NULL AUTO_INCREMENT,
+    name varchar(160) NOT NULL,
+    slug varchar(80) NOT NULL,
+    status enum('active','inactive','draft','published','archived') NOT NULL DEFAULT 'active',
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY tenants_slug_unique (slug)
+  )`,
+    `CREATE TABLE IF NOT EXISTS ov_users (
+    id int NOT NULL AUTO_INCREMENT,
+    email varchar(190) NOT NULL,
+    name varchar(160) NOT NULL,
+    password_hash varchar(255) NOT NULL,
+    status enum('active','inactive','draft','published','archived') NOT NULL DEFAULT 'active',
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY users_email_unique (email)
+  )`,
+    `CREATE TABLE IF NOT EXISTS ov_tenant_members (
+    id int NOT NULL AUTO_INCREMENT,
+    tenant_id int NOT NULL,
+    user_id int NOT NULL,
+    member_role enum('owner','admin','member') NOT NULL DEFAULT 'member',
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY tenant_members_unique (tenant_id, user_id),
+    CONSTRAINT ov_tenant_members_tenant_fk FOREIGN KEY (tenant_id) REFERENCES ov_tenants (id),
+    CONSTRAINT ov_tenant_members_user_fk FOREIGN KEY (user_id) REFERENCES ov_users (id)
+  )`,
     `CREATE TABLE IF NOT EXISTS ov_projects (
     id int NOT NULL AUTO_INCREMENT,
+    tenant_id int,
     name varchar(160) NOT NULL,
     description text,
     status enum('active','inactive','draft','published','archived') NOT NULL DEFAULT 'active',
     created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (id)
+    PRIMARY KEY (id),
+    CONSTRAINT ov_projects_tenant_fk FOREIGN KEY (tenant_id) REFERENCES ov_tenants (id)
+  )`,
+    `CREATE TABLE IF NOT EXISTS ov_capabilities (
+    id int NOT NULL AUTO_INCREMENT,
+    tenant_id int NOT NULL,
+    capability_key varchar(120) NOT NULL,
+    name varchar(160) NOT NULL,
+    description text,
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY capabilities_tenant_key_unique (tenant_id, capability_key),
+    CONSTRAINT ov_capabilities_tenant_fk FOREIGN KEY (tenant_id) REFERENCES ov_tenants (id)
   )`,
     `CREATE TABLE IF NOT EXISTS ov_model_providers (
     id int NOT NULL AUTO_INCREMENT,
@@ -37,16 +83,64 @@ const statements = [
     UNIQUE KEY models_provider_name_unique (provider_id, name),
     CONSTRAINT ov_models_provider_fk FOREIGN KEY (provider_id) REFERENCES ov_model_providers (id)
   )`,
-    `CREATE TABLE IF NOT EXISTS ov_agents (
+    `CREATE TABLE IF NOT EXISTS ov_workflows (
     id int NOT NULL AUTO_INCREMENT,
     project_id int NOT NULL,
     name varchar(160) NOT NULL,
-    description text,
-    capabilities_json json,
+    version varchar(40) NOT NULL,
+    current_version_id int,
+    definition_json json,
+    status enum('active','inactive','draft','published','archived') NOT NULL DEFAULT 'draft',
+    run_status enum('pending','running','paused','awaiting_decision','completed','failed','cancelled'),
     created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
-    CONSTRAINT ov_agents_project_fk FOREIGN KEY (project_id) REFERENCES ov_projects (id)
+    CONSTRAINT ov_workflows_project_fk FOREIGN KEY (project_id) REFERENCES ov_projects (id)
+  )`,
+    `CREATE TABLE IF NOT EXISTS ov_workflow_versions (
+    id int NOT NULL AUTO_INCREMENT,
+    workflow_id int NOT NULL,
+    version varchar(40) NOT NULL,
+    seq int NOT NULL,
+    name varchar(160) NOT NULL,
+    definition_json json NOT NULL,
+    published_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY workflow_versions_workflow_version_unique (workflow_id, version),
+    UNIQUE KEY workflow_versions_workflow_seq_unique (workflow_id, seq),
+    CONSTRAINT ov_workflow_versions_workflow_fk FOREIGN KEY (workflow_id) REFERENCES ov_workflows (id)
+  )`,
+    `CREATE TABLE IF NOT EXISTS ov_skills (
+    id int NOT NULL AUTO_INCREMENT,
+    tenant_id int NOT NULL,
+    skill_key varchar(120) NOT NULL,
+    name varchar(160) NOT NULL,
+    description text,
+    skill_kind enum('builtin','custom') NOT NULL DEFAULT 'custom',
+    tools_json json,
+    content_md text,
+    config_json json,
+    status enum('active','inactive','draft','published','archived') NOT NULL DEFAULT 'active',
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY skills_tenant_key_unique (tenant_id, skill_key),
+    CONSTRAINT ov_skills_tenant_fk FOREIGN KEY (tenant_id) REFERENCES ov_tenants (id)
+  )`,
+    `CREATE TABLE IF NOT EXISTS ov_agents (
+    id int NOT NULL AUTO_INCREMENT,
+    project_id int NOT NULL,
+    workflow_id int,
+    name varchar(160) NOT NULL,
+    description text,
+    capabilities_json json,
+    skills_json json,
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY agents_workflow_id_idx (workflow_id),
+    CONSTRAINT ov_agents_project_fk FOREIGN KEY (project_id) REFERENCES ov_projects (id),
+    CONSTRAINT ov_agents_workflow_fk FOREIGN KEY (workflow_id) REFERENCES ov_workflows (id)
   )`,
     `CREATE TABLE IF NOT EXISTS ov_agent_versions (
     id int NOT NULL AUTO_INCREMENT,
@@ -63,25 +157,14 @@ const statements = [
     CONSTRAINT ov_agent_versions_agent_fk FOREIGN KEY (agent_id) REFERENCES ov_agents (id),
     CONSTRAINT ov_agent_versions_model_fk FOREIGN KEY (model_id) REFERENCES ov_models (id)
   )`,
-    `CREATE TABLE IF NOT EXISTS ov_workflows (
-    id int NOT NULL AUTO_INCREMENT,
-    project_id int NOT NULL,
-    name varchar(160) NOT NULL,
-    version varchar(40) NOT NULL,
-    definition_json json,
-    status enum('active','inactive','draft','published','archived') NOT NULL DEFAULT 'draft',
-    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    CONSTRAINT ov_workflows_project_fk FOREIGN KEY (project_id) REFERENCES ov_projects (id)
-  )`,
     `CREATE TABLE IF NOT EXISTS ov_workflow_nodes (
     id int NOT NULL AUTO_INCREMENT,
     workflow_id int NOT NULL,
     name varchar(160) NOT NULL,
     capability varchar(120) NOT NULL,
     skill varchar(120),
-    node_type enum('task','checkpoint') NOT NULL DEFAULT 'task',
+    capabilities_json json,
+    node_type enum('task','checkpoint','start','end') NOT NULL DEFAULT 'task',
     config_json json,
     PRIMARY KEY (id),
     CONSTRAINT ov_workflow_nodes_workflow_fk FOREIGN KEY (workflow_id) REFERENCES ov_workflows (id)
@@ -101,6 +184,7 @@ const statements = [
     `CREATE TABLE IF NOT EXISTS ov_workflow_runs (
     id int NOT NULL AUTO_INCREMENT,
     workflow_id int NOT NULL,
+    workflow_version_id int,
     run_status enum('pending','running','paused','awaiting_decision','completed','failed','cancelled') NOT NULL DEFAULT 'pending',
     current_plan_version int NOT NULL DEFAULT 1,
     idempotency_key varchar(160),
@@ -110,6 +194,7 @@ const statements = [
     completed_at datetime,
     created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
+    UNIQUE KEY workflow_runs_workflow_unique (workflow_id),
     UNIQUE KEY workflow_runs_idempotency_unique (idempotency_key),
     CONSTRAINT ov_workflow_runs_workflow_fk FOREIGN KEY (workflow_id) REFERENCES ov_workflows (id)
   )`,
@@ -181,121 +266,28 @@ const statements = [
     CONSTRAINT ov_checkpoints_task_fk FOREIGN KEY (task_id) REFERENCES ov_tasks (id),
     CONSTRAINT ov_checkpoints_node_fk FOREIGN KEY (workflow_node_id) REFERENCES ov_workflow_nodes (id)
   )`,
-    `CREATE TABLE IF NOT EXISTS ov_artifacts (
+    `CREATE TABLE IF NOT EXISTS ov_node_messages (
     id int NOT NULL AUTO_INCREMENT,
-    project_id int NOT NULL,
-    workflow_run_id int,
-    task_id int,
+    workflow_id int NOT NULL,
+    workflow_version_id int,
+    node_key varchar(160) NOT NULL,
     session_id int,
-    name varchar(240) NOT NULL,
-    kind varchar(80) NOT NULL DEFAULT 'text',
-    artifact_status enum('draft','ready','approved','rejected','archived') NOT NULL DEFAULT 'ready',
-    current_version int NOT NULL DEFAULT 1,
-    metadata_json json,
-    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    CONSTRAINT ov_artifacts_project_fk FOREIGN KEY (project_id) REFERENCES ov_projects (id),
-    CONSTRAINT ov_artifacts_run_fk FOREIGN KEY (workflow_run_id) REFERENCES ov_workflow_runs (id),
-    CONSTRAINT ov_artifacts_task_fk FOREIGN KEY (task_id) REFERENCES ov_tasks (id),
-    CONSTRAINT ov_artifacts_session_fk FOREIGN KEY (session_id) REFERENCES ov_sessions (id)
-  )`,
-    `CREATE TABLE IF NOT EXISTS ov_artifact_versions (
-    id int NOT NULL AUTO_INCREMENT,
-    artifact_id int NOT NULL,
-    version int NOT NULL,
+    node_message_role enum('user','assistant') NOT NULL,
     content text NOT NULL,
-    mime_type varchar(120) NOT NULL DEFAULT 'text/plain',
-    created_by varchar(80) NOT NULL DEFAULT 'agent',
+    thinking text,
+    node_message_status enum('pending','streaming','completed','failed') NOT NULL DEFAULT 'completed',
     created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
-    UNIQUE KEY artifact_versions_unique (artifact_id, version),
-    CONSTRAINT ov_artifact_versions_artifact_fk FOREIGN KEY (artifact_id) REFERENCES ov_artifacts (id)
-  )`,
-    `CREATE TABLE IF NOT EXISTS ov_memories (
-    id int NOT NULL AUTO_INCREMENT,
-    project_id int NOT NULL,
-    agent_id int,
-    memory_scope enum('project','agent') NOT NULL DEFAULT 'project',
-    memory_key varchar(180) NOT NULL,
-    content text NOT NULL,
-    metadata_json json,
-    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    CONSTRAINT ov_memories_project_fk FOREIGN KEY (project_id) REFERENCES ov_projects (id),
-    CONSTRAINT ov_memories_agent_fk FOREIGN KEY (agent_id) REFERENCES ov_agents (id)
-  )`,
-    `CREATE TABLE IF NOT EXISTS ov_chat_threads (
-    id int NOT NULL AUTO_INCREMENT,
-    project_id int NOT NULL,
-    agent_id int NOT NULL,
-    title varchar(200) NOT NULL,
-    chat_status enum('active','archived') NOT NULL DEFAULT 'active',
-    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    CONSTRAINT ov_chat_threads_project_fk FOREIGN KEY (project_id) REFERENCES ov_projects (id),
-    CONSTRAINT ov_chat_threads_agent_fk FOREIGN KEY (agent_id) REFERENCES ov_agents (id)
-  )`,
-    `CREATE TABLE IF NOT EXISTS ov_chat_messages (
-    id int NOT NULL AUTO_INCREMENT,
-    thread_id int NOT NULL,
-    session_id int,
-    chat_role enum('user','assistant','system') NOT NULL,
-    content text NOT NULL,
-    message_status enum('pending','streaming','completed','failed') NOT NULL DEFAULT 'completed',
-    metadata_json json,
-    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    CONSTRAINT ov_chat_messages_thread_fk FOREIGN KEY (thread_id) REFERENCES ov_chat_threads (id),
-    CONSTRAINT ov_chat_messages_session_fk FOREIGN KEY (session_id) REFERENCES ov_sessions (id)
-  )`,
-    `CREATE TABLE IF NOT EXISTS ov_permission_policies (
-    id int NOT NULL AUTO_INCREMENT,
-    project_id int NOT NULL,
-    agent_id int,
-    name varchar(160) NOT NULL,
-    rules_json json NOT NULL,
-    status enum('active','inactive','draft','published','archived') NOT NULL DEFAULT 'active',
-    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    CONSTRAINT ov_permission_policies_project_fk FOREIGN KEY (project_id) REFERENCES ov_projects (id),
-    CONSTRAINT ov_permission_policies_agent_fk FOREIGN KEY (agent_id) REFERENCES ov_agents (id)
-  )`,
-    `CREATE TABLE IF NOT EXISTS ov_budgets (
-    id int NOT NULL AUTO_INCREMENT,
-    project_id int NOT NULL,
-    workflow_run_id int,
-    limit_units int NOT NULL,
-    used_units int NOT NULL DEFAULT 0,
-    budget_status enum('active','exhausted','closed') NOT NULL DEFAULT 'active',
-    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    CONSTRAINT ov_budgets_project_fk FOREIGN KEY (project_id) REFERENCES ov_projects (id),
-    CONSTRAINT ov_budgets_run_fk FOREIGN KEY (workflow_run_id) REFERENCES ov_workflow_runs (id)
-  )`,
-    `CREATE TABLE IF NOT EXISTS ov_usage_records (
-    id int NOT NULL AUTO_INCREMENT,
-    budget_id int,
-    workflow_run_id int,
-    task_id int,
-    agent_id int,
-    units int NOT NULL DEFAULT 1,
-    metadata_json json,
-    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    CONSTRAINT ov_usage_records_budget_fk FOREIGN KEY (budget_id) REFERENCES ov_budgets (id),
-    CONSTRAINT ov_usage_records_run_fk FOREIGN KEY (workflow_run_id) REFERENCES ov_workflow_runs (id),
-    CONSTRAINT ov_usage_records_task_fk FOREIGN KEY (task_id) REFERENCES ov_tasks (id),
-    CONSTRAINT ov_usage_records_agent_fk FOREIGN KEY (agent_id) REFERENCES ov_agents (id)
+    KEY node_messages_workflow_key (workflow_id, node_key),
+    KEY node_messages_version_idx (workflow_version_id),
+    CONSTRAINT ov_node_messages_workflow_fk FOREIGN KEY (workflow_id) REFERENCES ov_workflows (id),
+    CONSTRAINT ov_node_messages_session_fk FOREIGN KEY (session_id) REFERENCES ov_sessions (id)
   )`,
     `CREATE TABLE IF NOT EXISTS ov_events (
     id int NOT NULL AUTO_INCREMENT,
     project_id int NOT NULL,
     workflow_run_id int,
+    workflow_version_id int,
     task_id int,
     session_id int,
     agent_id int,
@@ -303,6 +295,7 @@ const statements = [
     payload_json json,
     created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
+    KEY events_version_idx (workflow_version_id),
     CONSTRAINT ov_events_project_fk FOREIGN KEY (project_id) REFERENCES ov_projects (id),
     CONSTRAINT ov_events_run_fk FOREIGN KEY (workflow_run_id) REFERENCES ov_workflow_runs (id),
     CONSTRAINT ov_events_task_fk FOREIGN KEY (task_id) REFERENCES ov_tasks (id),
@@ -317,7 +310,7 @@ const statements = [
     question text NOT NULL,
     decision text,
     decided_by varchar(80) NOT NULL DEFAULT 'human',
-    decision_action enum('approve','request_changes','reject','override','replan'),
+    decision_action enum('approve','request_changes','reject','override','replan','repeat'),
     decision_status enum('pending','approved','changes_requested','rejected','overridden','superseded') NOT NULL DEFAULT 'pending',
     context_json json,
     created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -327,6 +320,17 @@ const statements = [
     CONSTRAINT ov_decisions_run_fk FOREIGN KEY (workflow_run_id) REFERENCES ov_workflow_runs (id),
     CONSTRAINT ov_decisions_checkpoint_fk FOREIGN KEY (checkpoint_id) REFERENCES ov_checkpoints (id)
   )`,
+];
+const retiredTables = [
+    'ov_artifact_versions',
+    'ov_artifacts',
+    'ov_memories',
+    'ov_chat_messages',
+    'ov_chat_threads',
+    'ov_usage_records',
+    'ov_budgets',
+    'ov_permission_policies',
+    'ov_alerts',
 ];
 export const requiredTableNames = statements.map((statement) => {
     const match = statement.match(/^CREATE TABLE IF NOT EXISTS (ov_[a-z_]+)/);
@@ -380,9 +384,82 @@ export function parseTableDefinitions(statement) {
 }
 export const tableDefinitions = statements.map(parseTableDefinitions);
 export async function ensureTables() {
+    await pool.query('SET FOREIGN_KEY_CHECKS=0');
+    for (const table of retiredTables) {
+        await pool.query(`DROP TABLE IF EXISTS ${table}`);
+    }
+    await pool.query('SET FOREIGN_KEY_CHECKS=1');
     for (const statement of statements) {
         await pool.query(statement);
     }
+}
+/** 能力目录从按项目改为按租户共享。 */
+export async function migrateCapabilitiesToTenant() {
+    const [tables] = await pool.query(`SELECT table_name AS tableName
+       FROM information_schema.tables
+      WHERE table_schema = DATABASE() AND table_name = 'ov_capabilities'`);
+    if (tables.length === 0)
+        return;
+    const [columns] = await pool.query(`SELECT column_name AS columnName
+       FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'ov_capabilities'`);
+    const names = new Set(columns.map((row) => row.columnName));
+    if (names.has('tenant_id') && !names.has('project_id')) {
+        await pool.query(`
+      DELETE c0 FROM ov_capabilities c0
+      INNER JOIN ov_capabilities c1
+        ON c0.capability_key = c1.capability_key
+       AND c1.tenant_id = (SELECT id FROM ov_tenants ORDER BY id ASC LIMIT 1)
+       WHERE c0.tenant_id IS NULL OR c0.tenant_id = 0
+    `);
+        await pool.query(`
+      UPDATE ov_capabilities
+         SET tenant_id = (SELECT id FROM ov_tenants ORDER BY id ASC LIMIT 1)
+       WHERE tenant_id IS NULL OR tenant_id = 0
+    `);
+        return;
+    }
+    if (!names.has('project_id'))
+        return;
+    if (!names.has('tenant_id')) {
+        await pool.query('ALTER TABLE ov_capabilities ADD COLUMN tenant_id int NULL');
+    }
+    await pool.query(`
+    UPDATE ov_capabilities c
+    INNER JOIN ov_projects p ON p.id = c.project_id
+       SET c.tenant_id = p.tenant_id
+     WHERE c.tenant_id IS NULL OR c.tenant_id = 0
+  `);
+    await pool.query(`
+    UPDATE ov_capabilities
+       SET tenant_id = (SELECT id FROM ov_tenants ORDER BY id ASC LIMIT 1)
+     WHERE tenant_id IS NULL OR tenant_id = 0
+  `);
+    await pool.query(`
+    DELETE c1 FROM ov_capabilities c1
+    INNER JOIN ov_capabilities c2
+      ON c1.tenant_id = c2.tenant_id
+     AND c1.capability_key = c2.capability_key
+     AND c1.id > c2.id
+  `);
+    const [fkRows] = await pool.query(`SELECT constraint_name AS constraintName
+       FROM information_schema.referential_constraints
+      WHERE constraint_schema = DATABASE() AND table_name = 'ov_capabilities'`);
+    for (const row of fkRows) {
+        await pool.query(`ALTER TABLE ov_capabilities DROP FOREIGN KEY \`${row.constraintName}\``);
+    }
+    const [indexRows] = await pool.query(`SELECT DISTINCT index_name AS indexName
+       FROM information_schema.statistics
+      WHERE table_schema = DATABASE()
+        AND table_name = 'ov_capabilities'
+        AND index_name <> 'PRIMARY'`);
+    for (const row of indexRows) {
+        await pool.query(`ALTER TABLE ov_capabilities DROP INDEX \`${row.indexName}\``);
+    }
+    await pool.query('ALTER TABLE ov_capabilities DROP COLUMN project_id');
+    await pool.query('ALTER TABLE ov_capabilities MODIFY tenant_id int NOT NULL');
+    await pool.query('ALTER TABLE ov_capabilities ADD UNIQUE KEY capabilities_tenant_key_unique (tenant_id, capability_key)');
+    await pool.query('ALTER TABLE ov_capabilities ADD CONSTRAINT ov_capabilities_tenant_fk FOREIGN KEY (tenant_id) REFERENCES ov_tenants (id)');
 }
 export async function repairSchema() {
     const issues = await schemaIntegrityIssues();
@@ -466,4 +543,19 @@ export async function schemaIntegrityIssues() {
         }
     }
     return issues;
+}
+export async function repairEnums() {
+    const alters = [
+        ['ov_workflow_nodes', 'node_type', "enum('task','checkpoint','start','end') NOT NULL DEFAULT 'task'"],
+        ['ov_decisions', 'decision_action', "enum('approve','request_changes','reject','override','replan','repeat')"],
+    ];
+    for (const [table, column, definition] of alters) {
+        const [rows] = await pool.query(`SELECT COLUMN_TYPE AS columnType
+         FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`, [table, column]);
+        const current = rows[0]?.columnType ?? '';
+        if (!current || current.includes("'start'") || current.includes("'repeat'"))
+            continue;
+        await pool.query(`ALTER TABLE ${table} MODIFY COLUMN ${column} ${definition}`);
+    }
 }
