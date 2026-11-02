@@ -10,5 +10,5 @@ dist/
 *.tsbuildinfo
 .DS_Store
 *.log
-.idea
-.cursor
+.idea/
+.cursor/

@@ -57,6 +57,7 @@ async function seed() {
         const review = await db.insert(workflowNodes).values({
             workflowId: workflow.id,
             name: 'Human approval',
+            capability: '',
             capabilitiesJson: [],
             nodeType: 'checkpoint',
             configJson: { question: 'Approve the generated artifact?' },

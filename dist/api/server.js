@@ -12,12 +12,13 @@ import { assertRunTransition, assertTaskTransition } from '../domain/state-machi
 import { assertProjectInTenant, authenticateUser, bootstrapTenancy, defaultTenantId, membershipsForUser, registerUser, } from '../application/tenancy.js';
 import { apiKeyFromProviderConfig, parseModelId, piLaunchCredentials, publicProviderConfig, resolveAgentModel, resolveModelById, resolveWorkflowNode, withProviderApiKey, } from '../application/model-resolver.js';
 import { assertProjectCatalogKeys, collectCapabilityKeys, ensureTenantCapabilities, normalizeCapabilityKey, storedNodeCapabilityKeys, tenantIdOfProject, workflowNodeCapabilityKeys } from '../application/capabilities.js';
-import { assertProjectSkillKeys, collectSkillKeys, ensureTenantSkills, loadAgentSkills, materializeSkillDirs, normalizeSkillKey, runtimePolicyFromSkills, } from '../application/skills.js';
+import { assertProjectSkillKeys, BASE_AGENT_TOOLS, collectSkillKeys, ensureTenantSkills, loadAgentSkills, materializeSkillDirs, normalizeSkillKey, runtimePolicyFromSkills, } from '../application/skills.js';
 import { installSkillMarkdown, installSkillZipPackage, parseSkillFrontmatter, removeSkillStore, syncSkillMarkdownFile, } from '../application/skill-packages.js';
 import { deleteAgentsByIds } from '../application/delete-agents.js';
 import { assertWorkingDirectoryAllowed, resolveRuntimePolicy } from '../application/runtime-policy.js';
 import { acceptanceLimit, acceptanceRuleLines, parseAcceptanceVerdict } from '../application/acceptance.js';
 import { assertAcyclicGraph, effectiveWorkflowNodeId, graphIsComplete, plannedTaskStatus, reachableFromRoots, selectRunnableTasks } from '../application/task-graph.js';
+import { dependenciesSatisfied, executionFocusKeys, focusTaskUpdates, handoffContent, mentionKeysFromText, routeGroupMessage, splitNodeAction, taskKeyInFocus, } from '../application/group-chat.js';
 import { pickLatestTasksByKey, resumeFrontier } from '../application/resume-graph.js';
 import { buildMysqlUrl, buildRedisUrl, maskSecret, parseMysqlUrl, parseRedisUrl, probeMysql, probePi, probeRedis, readLocalEnv, writeLocalEnv, } from '../application/local-env.js';
 import { allocateSequenceFolder, deleteInputFile, directoryExists, ensureDirectory, executionDirectory, executionStamp, folderBaseName, inputDirectory, isManagedWorkspace, listInputFiles, openDirectory, resolveWorkflowRoot, sequenceFolderName, listDeliverableNames, loopForNode, loopsFromDefinition, nodeDirectory, readDeliverableText, saveInputFile, validateLoops, withTerminals, writeResult, writeStartInput, writeTaskBrief, } from '../application/workflow-workspace.js';
@@ -586,6 +587,7 @@ async function rebuildWorkflowRunGraph(workflowRunId, workflowId) {
         delete keptInput.executionId;
         delete keptInput.acceptanceRedos;
         delete keptInput.loopIterations;
+        delete keptInput.focusKeys;
         const planResult = await tx.insert(plans).values({
             workflowRunId,
             version,
@@ -831,6 +833,10 @@ async function syncTaskConfigsFromNodes(workflowRunId, workflowId) {
     }
 }
 async function prepareWorkflowRunForExecution(workflowRunId, workflowId, status, mode) {
+    if (mode === 'focus') {
+        await syncTaskConfigsFromNodes(workflowRunId, workflowId);
+        return;
+    }
     if (mode === 'restart') {
         await rebuildWorkflowRunGraph(workflowRunId, workflowId);
         return;
@@ -861,8 +867,11 @@ async function runInput(workflowRunId) {
     return jsonObject(row?.inputJson);
 }
 async function managedWorkflowRoot(workflowId) {
-    const workflow = (await db.select({ name: workflows.name }).from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
-    const resolved = await resolveWorkflowRoot(workflowId, workflow?.name ?? '');
+    const workflow = (await db.select({ name: workflows.name, projectId: workflows.projectId }).from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
+    const project = workflow
+        ? (await db.select({ name: projects.name }).from(projects).where(eq(projects.id, workflow.projectId)).limit(1))[0]
+        : undefined;
+    const resolved = await resolveWorkflowRoot(workflowId, workflow?.name ?? '', project?.name ?? '');
     for (const move of resolved.moves)
         await rewriteStoredPaths(move.workflowId, move.from, move.to);
     return resolved.root;
@@ -1003,7 +1012,7 @@ async function latestNodeDirectory(workflowId, nodeKey) {
     }
     return directory && await directoryExists(directory) ? directory : undefined;
 }
-async function replyToNode(workflowId, nodeKey, content, assistantMessageId, sessionId, onStream) {
+async function replyToNode(workflowId, nodeKey, content, assistantMessageId, sessionId, onStream, decideExecution = false) {
     const workflow = (await db.select().from(workflows).where(eq(workflows.id, workflowId)))[0];
     const node = (await db.select().from(workflowNodes).where(eq(workflowNodes.workflowId, workflowId)))
         .find((item) => recordKey(item.configJson) === nodeKey);
@@ -1053,28 +1062,19 @@ async function replyToNode(workflowId, nodeKey, content, assistantMessageId, ses
     const skillPaths = await materializeSkillDirs(skillRows, workingDirectory);
     const canUseTools = Boolean(directory) || skillRows.length > 0;
     const allowedTools = skillRows.length > 0
-        ? skillPolicy.allowedTools
-        : (directory ? fallbackPolicy.allowedTools : []);
+        ? skillPolicy.allowedTools ?? [...BASE_AGENT_TOOLS]
+        : (directory ? fallbackPolicy.allowedTools ?? [...BASE_AGENT_TOOLS] : []);
     const isGroupChat = content.startsWith('[群聊');
+    const userMessage = content.replace(/^\[群聊 @你\]\s*/, '');
     const prompt = isGroupChat
         ? [
-            `你是 Agent「${node.name}」，正在参与一个多Agent协作的群聊。`,
-            instruction.trim() ? `你的职责和专长：\n${instruction.trim()}` : '',
-            outputRequirement.trim() ? `你的工作目标：\n${outputRequirement.trim()}` : '',
-            executionContext.trim() ? `你当前的工作进展：\n${executionContext.trim()}` : '',
-            neighborContext.trim() ? `协作伙伴的情况：\n${neighborContext.trim()}` : '',
-            history.trim() ? `之前的对话记录：\n${history.trim()}` : '',
-            `现在有人在群聊中 @了你，消息内容是：\n${content.replace(/^\[群聊 @你\]\s*/, '')}`,
-            '\n请根据你的角色和专业领域，自然地回复这条消息。你可以：',
-            '- 回答对方的问题',
-            '- 提供你的专业见解',
-            '- 说明你会如何处理相关任务',
-            '- 如果问题超出你的职责范围，可以礼貌地说明',
-            '\n回复要求：',
-            '- 用自然、友好的语气，像真实的同事一样交流',
-            '- 可以适当详细，不要过于简短',
-            '- 展现你的专业能力，但避免使用过于技术化的内部术语',
-        ].filter(Boolean).join('\n\n')
+            `你是「${node.name}」。`,
+            instruction.trim() ? `${instruction.trim()}\n` : '',
+            outputRequirement.trim() ? `目标：${outputRequirement.trim()}\n` : '',
+            history.trim() ? `对话历史（最近5条）：\n${history.trim().split('\n').slice(-10).join('\n')}\n` : '',
+            `用户@你：${userMessage}`,
+            '只回答这一句问的内容，用一两句话讲完。不要复述背景、状态或文件。',
+        ].filter(Boolean).join('\n')
         : [
             `你是多 Agent 协作中的 Agent「${node.name}」。用户正在直接和你对话。`,
             executionContext.trim()
@@ -1090,9 +1090,14 @@ async function replyToNode(workflowId, nodeKey, content, assistantMessageId, ses
                 ? '当前目录就是这个 Agent 的工作目录。可以查看或按指导调整这里的文件；正在跑的那次执行不会因本次对话而中断。'
                 : skillRows.length
                     ? '这个 Agent 还没有自己的工作目录。你可以使用已启用的工具完成联网等操作并回复；不要创建无关文件。'
-                    : '这个 Agent 还没有自己的工作目录。只回复你理解的内容，以及执行时会怎么做。不要创建或修改文件。',
+                    : '这个 Agent 还没有自己的工作目录。不要创建或修改文件。',
             '用户的新指导会留下来，留给之后的执行继续生效。',
+            '上面的执行记录、上下游、任务说明和文件情况只作为上下文。不要复述，不要列状态，不要做表格，也不要报文件清单。',
+            '只回答用户这一句问的内容，用几句口语说完。',
             history.trim() ? `对话：\n${history.trim()}\n\n请回复最后一条用户消息。` : `用户刚才说：\n${content}`,
+            decideExecution
+                ? '如果用户是在让你开始做这个节点的任务，回复正文后另起一行只写 {"action":"execute"}。如果只是提问或讨论，回复正文后另起一行只写 {"action":"reply"}。不要在正文里写这段。'
+                : '',
         ].filter(Boolean).join('\n\n');
     const output = [];
     const thinking = [];
@@ -1137,7 +1142,7 @@ async function replyToNode(workflowId, nodeKey, content, assistantMessageId, ses
             outputJson: { interrupted: true },
             completedAt: new Date(),
         }).where(eq(sessions.id, sessionId));
-        return;
+        return 'reply';
     }
     await piRuntime.start({
         sessionId,
@@ -1160,17 +1165,17 @@ async function replyToNode(workflowId, nodeKey, content, assistantMessageId, ses
             if (runtimeEvent.type === 'stdout' && typeof runtimeEvent.payload === 'string') {
                 output.push(runtimeEvent.payload);
                 const fullOutput = output.join('');
-                onStream?.(fullOutput);
-                if (output.length % 3 === 0) {
-                    console.log(`[replyToNode] ✍️ stdout事件 #${output.length}, 累计长度: ${fullOutput.length}, 最新: "${runtimeEvent.payload.slice(0, 100)}..."`);
+                onStream?.(decideExecution ? splitNodeAction(fullOutput).visible : fullOutput);
+                if (output.length % 10 === 0) {
+                    console.log(`[replyToNode] ✍️ stdout #${output.length}, 总长: ${fullOutput.length}`);
                 }
             }
             if (runtimeEvent.type === 'activity' && typeof runtimeEvent.payload === 'string') {
                 activity = runtimeEvent.payload;
                 console.log(`[replyToNode] 🔧 activity: ${runtimeEvent.payload}`);
             }
-            if (runtimeEvent.type === 'error') {
-                console.error(`[replyToNode] ❌ 模型错误:`, runtimeEvent.payload);
+            if (runtimeEvent.type === 'stderr' && typeof runtimeEvent.payload === 'string') {
+                console.error(`[replyToNode] ❌ 模型错误: ${runtimeEvent.payload}`);
             }
             scheduleFlush();
         },
@@ -1184,9 +1189,11 @@ async function replyToNode(workflowId, nodeKey, content, assistantMessageId, ses
     await writes;
     const interrupted = interruptedNodeChatSessions.delete(sessionId);
     const streamed = output.join('').trim();
-    const text = interrupted
+    const rawText = interrupted
         ? streamed
         : (streamed || completed.message || '');
+    const decided = decideExecution && !interrupted ? splitNodeAction(rawText) : { visible: rawText.trim(), action: 'reply' };
+    const text = decided.visible;
     const thought = thinking.join('').trim();
     const failed = interrupted || completed.status !== 'completed';
     console.log(`[replyToNode] 🏁 模型调用完成:`);
@@ -1205,9 +1212,10 @@ async function replyToNode(workflowId, nodeKey, content, assistantMessageId, ses
     }).where(eq(nodeMessages.id, assistantMessageId));
     await db.update(sessions).set({
         status: failed ? 'failed' : 'completed',
-        outputJson: interrupted ? { text, interrupted: true } : { text },
+        outputJson: interrupted ? { text, interrupted: true } : { text, action: decided.action },
         completedAt: new Date(),
     }).where(eq(sessions.id, sessionId));
+    return failed ? 'reply' : decided.action;
 }
 async function prepareTaskWorkspace(workflowId, workflowRunId, task) {
     const input = jsonObject(task.inputJson);
@@ -1366,14 +1374,290 @@ async function insertWorkflowMessage(params) {
     const inserted = await db.select().from(workflowMessages).where(eq(workflowMessages.id, result[0].insertId));
     return inserted[0];
 }
-async function downstreamNodeKeys(workflowId, nodeKey) {
-    const allNodes = await db.select({ id: workflowNodes.id, configJson: workflowNodes.configJson }).from(workflowNodes).where(eq(workflowNodes.workflowId, workflowId));
+async function downstreamNodeDetails(workflowId, nodeKey) {
+    const allNodes = await db.select({ id: workflowNodes.id, name: workflowNodes.name, configJson: workflowNodes.configJson }).from(workflowNodes).where(eq(workflowNodes.workflowId, workflowId));
     const allEdges = await db.select().from(workflowEdges).where(eq(workflowEdges.workflowId, workflowId));
-    const current = allNodes.find((n) => recordKey(n.configJson) === nodeKey);
+    const current = allNodes.find((node) => recordKey(node.configJson) === nodeKey);
     if (!current)
         return [];
-    const downstreamIds = allEdges.filter((edge) => edge.sourceNodeId === current.id).map((edge) => edge.targetNodeId);
-    return downstreamIds.map((id) => { const n = allNodes.find((node) => node.id === id); return n ? recordKey(n.configJson) : ''; }).filter(Boolean);
+    return allEdges
+        .filter((edge) => edge.sourceNodeId === current.id)
+        .map((edge) => allNodes.find((node) => node.id === edge.targetNodeId))
+        .filter((node) => Boolean(node))
+        .map((node) => ({ key: recordKey(node.configJson), name: node.name }))
+        .filter((node) => node.key);
+}
+async function workflowKeyGraph(workflowId) {
+    const rows = await db.select().from(workflowNodes).where(eq(workflowNodes.workflowId, workflowId));
+    const edgeRows = await db.select().from(workflowEdges).where(eq(workflowEdges.workflowId, workflowId));
+    const nodes = rows.map((row) => ({
+        id: row.id,
+        key: recordKey(row.configJson),
+        name: row.name,
+        nodeType: row.nodeType,
+        modelId: parseModelId(jsonObject(row.configJson).modelId),
+    })).filter((node) => node.key);
+    const byId = new Map(nodes.map((node) => [node.id, node.key]));
+    const edges = edgeRows.flatMap((edge) => {
+        const source = byId.get(edge.sourceNodeId);
+        const target = byId.get(edge.targetNodeId);
+        return source && target ? [{ source, target }] : [];
+    });
+    return { nodes: nodes.map(({ key, name, nodeType, modelId }) => ({ key, name, nodeType, modelId })), edges };
+}
+async function latestTasksByKey(workflowRunId) {
+    const activePlan = (await db.select({ id: plans.id }).from(plans)
+        .where(and(eq(plans.workflowRunId, workflowRunId), eq(plans.status, 'active')))
+        .orderBy(desc(plans.version))
+        .limit(1))[0];
+    const rows = activePlan
+        ? await db.select().from(tasks).where(and(eq(tasks.workflowRunId, workflowRunId), eq(tasks.planId, activePlan.id)))
+        : await db.select().from(tasks).where(eq(tasks.workflowRunId, workflowRunId));
+    const latest = new Map();
+    for (const task of rows) {
+        const key = recordKey(task.inputJson);
+        if (key)
+            latest.set(key, task);
+    }
+    return latest;
+}
+async function busyNodeKeys(workflowId, workflowRunId) {
+    const busy = new Set();
+    for (const chatKey of activeNodeChats) {
+        const [id, nodeKey] = chatKey.split(':');
+        if (Number(id) === workflowId && nodeKey)
+            busy.add(nodeKey);
+    }
+    if (!workflowRunId)
+        return busy;
+    const latest = await latestTasksByKey(workflowRunId);
+    for (const [key, task] of latest) {
+        if (task.status === 'running')
+            busy.add(key);
+    }
+    return busy;
+}
+async function armChatFocus(workflowId, workflowRunId, seedKey) {
+    const run = (await db.select().from(workflowRuns).where(eq(workflowRuns.id, workflowRunId)))[0];
+    if (!run)
+        return { ok: false, reason: '还没有可执行的记录' };
+    if (run.status === 'running')
+        return { ok: false, reason: '当前流程正在执行，这次不会另外启动' };
+    if (run.status === 'awaiting_decision')
+        return { ok: false, reason: '当前在等待人工确认，处理完再继续' };
+    const { nodes, edges } = await workflowKeyGraph(workflowId);
+    const seed = nodes.find((node) => node.key === seedKey);
+    if (!seed || seed.nodeType === 'start' || seed.nodeType === 'end' || seed.nodeType === 'checkpoint') {
+        return { ok: false, reason: '这个节点不能从对话启动' };
+    }
+    const latest = await latestTasksByKey(workflowRunId);
+    const seedTask = latest.get(seedKey);
+    if (!seedTask)
+        return { ok: false, reason: '这个节点还没有执行任务，请先在画布上执行一次' };
+    if (seedTask.status === 'running')
+        return { ok: false, reason: '这个节点正在执行' };
+    const completed = new Set([...latest.entries()].filter(([, task]) => task.status === 'completed').map(([key]) => key));
+    if (!dependenciesSatisfied(seedKey, edges, completed))
+        return { ok: false, reason: '上游还没完成，现在不能开始' };
+    const focus = executionFocusKeys(nodes.map((node) => node.key), edges, seedKey);
+    const statuses = new Map([...latest.entries()].map(([key, task]) => [key, task.status]));
+    for (const [key, status] of focusTaskUpdates({ seedKey, seedStatus: seedTask.status, focusKeys: focus, edges, statuses })) {
+        const task = latest.get(key);
+        if (!task)
+            continue;
+        await db.update(tasks).set({ status, errorKind: null }).where(eq(tasks.id, task.id));
+    }
+    const input = jsonObject(run.inputJson);
+    await db.update(workflowRuns).set({
+        inputJson: { ...input, focusKeys: focus },
+        errorJson: null,
+        completedAt: null,
+    }).where(eq(workflowRuns.id, workflowRunId));
+    return { ok: true };
+}
+async function startFocusedRun(workflowRunId) {
+    const run = (await db.select({ status: workflowRuns.status }).from(workflowRuns).where(eq(workflowRuns.id, workflowRunId)))[0];
+    if (!run)
+        return '还没有可执行的记录';
+    if (run.status === 'running' || executingWorkflowRuns.has(workflowRunId))
+        return '当前流程正在执行，这次不会另外启动';
+    try {
+        requireRunTransition(run.status, 'running');
+    }
+    catch (error) {
+        return error instanceof Error ? error.message : '当前状态不能开始执行';
+    }
+    let locked = await redisRuntime().acquireLock(`run:${workflowRunId}`, 3600);
+    if (!locked && (run.status === 'failed' || run.status === 'completed' || run.status === 'cancelled' || run.status === 'paused' || run.status === 'pending')) {
+        await redisRuntime().releaseLock(`run:${workflowRunId}`);
+        locked = await redisRuntime().acquireLock(`run:${workflowRunId}`, 3600);
+    }
+    if (!locked)
+        return '当前流程正在执行，这次不会另外启动';
+    scheduleWorkflowExecution(workflowRunId, 'focus');
+    return null;
+}
+async function conductorReply(workflowId, nodeKeys, content, onStream) {
+    const { nodes, edges } = await workflowKeyGraph(workflowId);
+    const modelNode = nodes.find((node) => nodeKeys.includes(node.key) && node.modelId) ?? nodes.find((node) => node.modelId);
+    if (!modelNode?.modelId)
+        throw new Error('请先为 Agent 选择模型');
+    const launch = piLaunchCredentials(await resolveModelById(modelNode.modelId));
+    const run = (await db.select({ id: workflowRuns.id }).from(workflowRuns).where(eq(workflowRuns.workflowId, workflowId)).orderBy(desc(workflowRuns.id)).limit(1))[0];
+    const latest = run ? await latestTasksByKey(run.id) : new Map();
+    const lines = nodes
+        .filter((node) => nodeKeys.includes(node.key))
+        .map((node) => {
+        const task = latest.get(node.key);
+        const status = task ? (NODE_STATUS_LABEL[task.status] ?? task.status) : '未执行';
+        const downstream = edges.filter((edge) => edge.source === node.key).map((edge) => nodes.find((item) => item.key === edge.target)?.name).filter(Boolean);
+        return `${node.name}（${node.nodeType === 'checkpoint' ? '人工复核' : 'Agent'}）：${status}${task?.status === 'running' ? '，正在执行，不能打断' : ''}${downstream.length ? `，下游是${downstream.join('、')}` : ''}`;
+    });
+    const prompt = [
+        '你是这条工作流群聊里的管理员。',
+        '你只替正在执行的节点回复。空闲节点会自己说话，不要替他们回答。',
+        '不要声称已经启动或停止了任务，也不要修改文件。正在执行的节点不能被打断。',
+        '只回答用户这一句。用几句话说完，不要把节点状态列成表格。',
+        lines.join('\n'),
+        `用户说：\n${content}`,
+    ].join('\n\n');
+    const created = await db.insert(sessions).values({
+        contextType: 'chat',
+        contextId: workflowId,
+        runtime: 'pi',
+        status: 'running',
+        inputJson: { conductor: true, nodeKeys },
+        startedAt: new Date(),
+    });
+    const sessionId = created[0].insertId;
+    const output = [];
+    const root = await managedWorkflowRoot(workflowId);
+    await piRuntime.start({
+        sessionId,
+        taskId: 0,
+        prompt,
+        provider: launch.provider,
+        model: launch.model,
+        apiKey: launch.apiKey,
+        workingDirectory: root,
+        allowedTools: [],
+        disableDefaultSkills: true,
+        onEvent: (runtimeEvent) => {
+            if (runtimeEvent.type === 'stdout' && typeof runtimeEvent.payload === 'string') {
+                output.push(runtimeEvent.payload);
+                onStream?.(output.join(''));
+            }
+        },
+    });
+    const completed = await piRuntime.wait(sessionId);
+    const text = output.join('').trim() || completed.message || '我看到了各节点现在的状态。';
+    await db.update(sessions).set({
+        status: completed.status === 'completed' ? 'completed' : 'failed',
+        outputJson: { text },
+        completedAt: new Date(),
+    }).where(eq(sessions.id, sessionId));
+    if (completed.status !== 'completed' && !output.join('').trim())
+        throw new Error(completed.message || '管理员没有回复');
+    return text;
+}
+const GROUP_ADMIN_KEY = '__conductor__';
+const GROUP_ADMIN_NAME = '管理员';
+async function streamAdminReply(workflowId, workflowRunId, nodeKeys, content, sseSend) {
+    sseSend('stream_start', { nodeKey: GROUP_ADMIN_KEY, name: GROUP_ADMIN_NAME, nodeType: 'task' });
+    let last = '';
+    const text = await conductorReply(workflowId, nodeKeys, content, (next) => {
+        if (next === last)
+            return;
+        last = next;
+        sseSend('stream_chunk', { nodeKey: GROUP_ADMIN_KEY, content: next });
+    });
+    await insertWorkflowMessage({ workflowId, workflowRunId, nodeKey: GROUP_ADMIN_KEY, type: 'guidance', content: text });
+    sseSend('stream_done', { nodeKey: GROUP_ADMIN_KEY, content: text });
+}
+async function streamCheckpointAck(workflowId, workflowRunId, nodeKey, nodeName, content, sseSend) {
+    const owner = (await db.select({ currentVersionId: workflows.currentVersionId }).from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
+    const workflowVersionId = owner?.currentVersionId ?? undefined;
+    const ack = '已记下，会写进这次复核说明。';
+    await db.insert(nodeMessages).values({ workflowId, workflowVersionId, nodeKey, role: 'user', content, status: 'completed' });
+    await db.insert(nodeMessages).values({ workflowId, workflowVersionId, nodeKey, role: 'assistant', content: ack, status: 'completed' });
+    await insertWorkflowMessage({ workflowId, workflowRunId, nodeKey, type: 'guidance', content: ack });
+    sseSend('stream_start', { nodeKey, name: nodeName, nodeType: 'checkpoint' });
+    sseSend('stream_done', { nodeKey, content: ack });
+}
+async function streamDirectGroupReply(workflowId, workflowRunId, nodeKey, nodeName, content, decideExecution, sseSend) {
+    const chatKey = `${workflowId}:${nodeKey}`;
+    if (!(await beginNodeChat(workflowId, nodeKey))) {
+        await streamAdminReply(workflowId, workflowRunId, [nodeKey], content, sseSend);
+        return;
+    }
+    let assistantMessageId = 0;
+    let sessionId = 0;
+    try {
+        const created = await db.transaction(async (tx) => {
+            const owner = (await tx.select({ currentVersionId: workflows.currentVersionId }).from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
+            const workflowVersionId = owner?.currentVersionId ?? undefined;
+            await tx.insert(nodeMessages).values({ workflowId, workflowVersionId, nodeKey, role: 'user', content, status: 'completed' });
+            const assistant = await tx.insert(nodeMessages).values({ workflowId, workflowVersionId, nodeKey, role: 'assistant', content: '', status: 'streaming' });
+            const runtimeSession = await tx.insert(sessions).values({
+                contextType: 'chat',
+                contextId: workflowId,
+                runtime: 'pi',
+                status: 'pending',
+                inputJson: { nodeKey, prompt: content },
+            });
+            const createdSessionId = runtimeSession[0].insertId;
+            await tx.update(nodeMessages).set({ sessionId: createdSessionId }).where(eq(nodeMessages.id, assistant[0].insertId));
+            return { assistantMessageId: assistant[0].insertId, sessionId: createdSessionId };
+        });
+        assistantMessageId = created.assistantMessageId;
+        sessionId = created.sessionId;
+        sseSend('stream_start', { nodeKey, name: nodeName, nodeType: 'task' });
+        let last = '';
+        const action = await replyToNode(workflowId, nodeKey, content, created.assistantMessageId, created.sessionId, (next) => {
+            if (next === last)
+                return;
+            last = next;
+            sseSend('stream_chunk', { nodeKey, content: next });
+        }, decideExecution);
+        const reply = (await db.select({ content: nodeMessages.content }).from(nodeMessages).where(eq(nodeMessages.id, created.assistantMessageId)))[0];
+        const visible = reply?.content?.trim() || '已收到';
+        await insertWorkflowMessage({ workflowId, workflowRunId, nodeKey, type: 'guidance', content: visible });
+        if (decideExecution && action === 'execute') {
+            if (!workflowRunId) {
+                await insertWorkflowMessage({ workflowId, workflowRunId, type: 'system', content: '还没有执行记录，请先在画布上执行一次' });
+            }
+            else {
+                const armed = await armChatFocus(workflowId, workflowRunId, nodeKey);
+                if (!armed.ok) {
+                    await insertWorkflowMessage({ workflowId, workflowRunId, nodeKey, type: 'system', content: armed.reason });
+                }
+                else {
+                    const startError = await startFocusedRun(workflowRunId);
+                    if (startError) {
+                        await insertWorkflowMessage({ workflowId, workflowRunId, nodeKey, type: 'system', content: startError });
+                    }
+                    else {
+                        await insertWorkflowMessage({ workflowId, workflowRunId, nodeKey, type: 'system', content: `已开始执行「${nodeName}」` });
+                    }
+                }
+            }
+        }
+        sseSend('stream_done', { nodeKey, content: visible });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Agent 没有回复';
+        if (assistantMessageId) {
+            await db.update(nodeMessages).set({ content: message, status: 'failed' }).where(eq(nodeMessages.id, assistantMessageId));
+        }
+        if (sessionId) {
+            await db.update(sessions).set({ status: 'failed', outputJson: { error: message }, completedAt: new Date() }).where(eq(sessions.id, sessionId));
+        }
+        sseSend('stream_error', { nodeKey, name: nodeName, error: message });
+        await insertWorkflowMessage({ workflowId, workflowRunId, nodeKey, type: 'guidance', content: message });
+    }
+    finally {
+        await endNodeChat(chatKey);
+    }
 }
 async function workflowRunSummary(workflowRunId) {
     const run = (await db.select({ workflowId: workflowRuns.workflowId }).from(workflowRuns).where(eq(workflowRuns.id, workflowRunId)))[0];
@@ -1461,8 +1745,15 @@ async function completeBoundaryNode(workflowId, workflowRunId, task) {
         payloadJson: { name: task.name, nodeType: input.nodeType, workspacePath: directory, preview: text.slice(0, 500) },
     });
     if (input.nodeType === 'start') {
-        const mentions = await downstreamNodeKeys(workflowId, nodeKey);
-        await insertWorkflowMessage({ workflowId, workflowRunId, nodeKey, type: 'completed', content: text.trim() || '需求已就绪', mentions });
+        const downstream = await downstreamNodeDetails(workflowId, nodeKey);
+        await insertWorkflowMessage({
+            workflowId,
+            workflowRunId,
+            nodeKey,
+            type: 'completed',
+            content: handoffContent(text.trim() || '需求已就绪', downstream.map((node) => node.name)),
+            mentions: downstream.map((node) => node.key),
+        });
     }
     else if (input.nodeType === 'end') {
         await insertWorkflowMessage({ workflowId, workflowRunId, nodeKey, type: 'system', content: '流程结束节点已汇总' });
@@ -2206,8 +2497,9 @@ async function executeWorkflowRun(workflowRunId, mode) {
         return { status: 'running', completedTaskIds: [] };
     await db.update(workflowRuns).set({ status: 'running', startedAt: new Date(), errorJson: null, completedAt: null }).where(eq(workflowRuns.id, workflowRunId));
     await rememberRunStatus(workflowRunId, 'running', run.workflowId);
+    await persistAndBroadcastEvent({ projectId: run.projectId, workflowRunId, type: 'workflow.started', payloadJson: { mode: mode ?? 'run' } });
     await prepareWorkflowRunForExecution(workflowRunId, run.workflowId, run.status, mode);
-    const freshExecution = mode === 'restart' || (mode !== 'resume' && (run.status === 'cancelled' || run.status === 'failed' || run.status === 'completed' || run.status === 'pending'));
+    const freshExecution = mode === 'restart' || (mode !== 'resume' && mode !== 'focus' && (run.status === 'cancelled' || run.status === 'failed' || run.status === 'completed' || run.status === 'pending'));
     await ensureRunExecution(workflowRunId, run.workflowId, freshExecution);
     if (freshExecution) {
         await insertWorkflowMessage({ workflowId: run.workflowId, workflowRunId, type: 'system', content: '流程开始执行' });
@@ -2228,7 +2520,21 @@ async function executeWorkflowRun(workflowRunId, mode) {
         const runTasks = activePlan
             ? await db.select().from(tasks).where(and(eq(tasks.workflowRunId, workflowRunId), eq(tasks.planId, activePlan.id))).orderBy(asc(tasks.id))
             : await db.select().from(tasks).where(eq(tasks.workflowRunId, workflowRunId)).orderBy(asc(tasks.id));
-        if (graphIsComplete(runTasks)) {
+        const focusKeys = (await runInput(workflowRunId)).focusKeys;
+        const focus = Array.isArray(focusKeys) ? focusKeys.filter((key) => typeof key === 'string' && key.length > 0) : [];
+        const useFocus = focus.length > 0 && runTasks.some((task) => taskKeyInFocus(recordKey(task.inputJson), focus));
+        const inFocus = (task) => !useFocus || taskKeyInFocus(recordKey(task.inputJson), focus);
+        const scopedTasks = useFocus ? runTasks.filter(inFocus) : runTasks;
+        if (graphIsComplete(scopedTasks)) {
+            if (!graphIsComplete(runTasks)) {
+                const currentInput = await runInput(workflowRunId);
+                const nextInput = { ...currentInput };
+                delete nextInput.focusKeys;
+                await db.update(workflowRuns).set({ status: 'paused', inputJson: nextInput, completedAt: null }).where(and(eq(workflowRuns.id, workflowRunId), eq(workflowRuns.status, 'running')));
+                await rememberRunStatus(workflowRunId, 'paused', run.workflowId);
+                await insertWorkflowMessage({ workflowId: run.workflowId, workflowRunId, type: 'system', content: '从对话启动的这一段已经完成' });
+                return { status: 'paused', completedTaskIds };
+            }
             await db.update(plans).set({ status: 'completed' }).where(and(eq(plans.workflowRunId, workflowRunId), eq(plans.status, 'active')));
             if (!(await finishRunIfStillRunning(workflowRunId, run.workflowId, 'completed', { completedAt: new Date() }))) {
                 return { status: 'cancelled', completedTaskIds };
@@ -2237,7 +2543,7 @@ async function executeWorkflowRun(workflowRunId, mode) {
             await insertWorkflowMessage({ workflowId: run.workflowId, workflowRunId, type: 'system', content: '流程执行完成' });
             return { status: 'completed', completedTaskIds };
         }
-        const ready = selectRunnableTasks(runTasks);
+        const ready = selectRunnableTasks(runTasks).filter(inFocus);
         const structural = ready.find((candidate) => {
             const kind = jsonObject(candidate.inputJson).nodeType;
             return kind === 'start' || kind === 'end';
@@ -2274,7 +2580,16 @@ async function executeWorkflowRun(workflowRunId, mode) {
             continue;
         }
         if (!task) {
-            const failed = runTasks.find((candidate) => candidate.status === 'failed');
+            if (useFocus && scopedTasks.some((candidate) => candidate.status === 'pending' || candidate.status === 'blocked') && !scopedTasks.some((candidate) => candidate.status === 'failed')) {
+                const currentInput = await runInput(workflowRunId);
+                const nextInput = { ...currentInput };
+                delete nextInput.focusKeys;
+                await db.update(workflowRuns).set({ status: 'paused', inputJson: nextInput }).where(and(eq(workflowRuns.id, workflowRunId), eq(workflowRuns.status, 'running')));
+                await rememberRunStatus(workflowRunId, 'paused', run.workflowId);
+                await insertWorkflowMessage({ workflowId: run.workflowId, workflowRunId, type: 'system', content: '下游还要等其他上游完成，这一段先停在这里' });
+                return { status: 'paused', completedTaskIds };
+            }
+            const failed = scopedTasks.find((candidate) => candidate.status === 'failed') ?? runTasks.find((candidate) => candidate.status === 'failed');
             const error = failed
                 ? {
                     error: `「${failed.name}」失败：${failureReason(failed.outputJson, '未知原因')}`,
@@ -2494,6 +2809,7 @@ async function executeAgentTask(projectId, workflowRunId, task) {
         return { status: 'failed', taskId: task.id, output: payload };
     }
     const output = [];
+    const allowedTools = runtimePolicy.allowedTools ?? [...BASE_AGENT_TOOLS];
     await db.update(tasks).set({ agentId, status: 'running' }).where(eq(tasks.id, task.id));
     await db.update(sessions).set({ agentId, status: 'running', startedAt: new Date() }).where(eq(sessions.id, session.id));
     const taskNodeKey = typeof sessionInput.key === 'string' ? sessionInput.key : task.name;
@@ -2514,7 +2830,7 @@ async function executeAgentTask(projectId, workflowRunId, task) {
             model: piModel,
             apiKey: piApiKey,
             workingDirectory,
-            allowedTools: runtimePolicy.allowedTools,
+            allowedTools,
             deniedTools: runtimePolicy.deniedTools,
             skillPaths,
             disableDefaultSkills: true,
@@ -2614,9 +2930,17 @@ async function executeAgentTask(projectId, workflowRunId, task) {
         const workspaceDir = typeof sessionInput.workspacePath === 'string' ? sessionInput.workspacePath : '';
         const deliverableNames = workspaceDir && isManagedWorkspace(workspaceDir) ? await listDeliverableNames(workspaceDir) : [];
         const attachments = deliverableNames.map((name) => ({ name, path: path.join(workspaceDir, name) }));
-        const mentions = await downstreamNodeKeys(taskWorkflowId, taskNodeKey);
+        const downstream = await downstreamNodeDetails(taskWorkflowId, taskNodeKey);
         const summary = text.trim().slice(0, 200) || `已完成，产出 ${deliverableNames.length} 个文件`;
-        await insertWorkflowMessage({ workflowId: taskWorkflowId, workflowRunId, nodeKey: taskNodeKey, type: 'completed', content: summary, mentions, attachments: attachments.length ? attachments : undefined });
+        await insertWorkflowMessage({
+            workflowId: taskWorkflowId,
+            workflowRunId,
+            nodeKey: taskNodeKey,
+            type: 'completed',
+            content: handoffContent(summary, downstream.map((node) => node.name)),
+            mentions: downstream.map((node) => node.key),
+            attachments: attachments.length ? attachments : undefined,
+        });
     }
     return { status: 'completed', taskId: task.id, output: completed };
 }
@@ -2981,7 +3305,7 @@ async function handler(request, response) {
                     redis: { status: redis.status(), url: redisDisplayUrl() },
                     runtime: 'pi',
                     auth: config.apiToken ? 'required' : 'open',
-                    version: '0.1.0-revision3',
+                    version: '0.1.0-v3.1',
                 };
                 return sendJson(response, schemaIssues.length > 0 || redis.status() !== 'ok' ? 503 : 200, payload);
             }
@@ -3879,224 +4203,94 @@ async function handler(request, response) {
                 const content = requiredString(body, 'content');
                 if (!content)
                     return sendJson(response, 400, { error: '请输入消息内容' });
-                const mentions = Array.isArray(body.mentions) ? body.mentions.filter((m) => typeof m === 'string') : [];
-                const allNodes = (await db.select().from(workflowNodes).where(eq(workflowNodes.workflowId, workflowId)))
-                    .filter((n) => n.nodeType !== 'start' && n.nodeType !== 'end');
-                const validNodeKeys = new Set(allNodes.map((n) => recordKey(n.configJson)));
-                const isAll = mentions.includes('__all__');
-                const filteredMentions = isAll
-                    ? allNodes.map((n) => recordKey(n.configJson))
-                    : mentions.filter((key) => validNodeKeys.has(key));
+                const graph = await workflowKeyGraph(workflowId);
+                const chatable = graph.nodes.filter((node) => node.nodeType === 'task');
+                const checkpoints = graph.nodes.filter((node) => node.nodeType === 'checkpoint');
+                const mentionKeys = mentionKeysFromText(content, [...chatable, ...checkpoints]);
                 const latestRun = (await db.select({ id: workflowRuns.id }).from(workflowRuns).where(eq(workflowRuns.workflowId, workflowId)).orderBy(desc(workflowRuns.id)).limit(1))[0];
                 const workflowRunId = latestRun?.id ?? null;
-                const msg = await insertWorkflowMessage({ workflowId, workflowRunId, type: 'guidance', content: content.trim(), mentions: filteredMentions.length ? filteredMentions : undefined });
-                const safeWrite = (data) => {
+                const route = routeGroupMessage({
+                    mentionKeys,
+                    chatableKeys: new Set(chatable.map((node) => node.key)),
+                    checkpointKeys: new Set(checkpoints.map((node) => node.key)),
+                    busyKeys: await busyNodeKeys(workflowId, workflowRunId),
+                });
+                const storedMentions = route.kind === 'save' ? undefined : mentionKeys.filter((key) => key !== '__all__');
+                const msg = await insertWorkflowMessage({
+                    workflowId,
+                    workflowRunId,
+                    type: 'guidance',
+                    content: content.trim(),
+                    mentions: storedMentions?.length ? storedMentions : undefined,
+                });
+                if (route.kind === 'save')
+                    return sendJson(response, 202, { status: 'accepted', data: msg });
+                const sseSend = (event, data) => {
                     try {
-                        return response.write(data);
+                        return response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
                     }
-                    catch (e) {
-                        console.error('[SSE] Write failed:', e);
+                    catch (error) {
+                        console.error('[SSE] Write failed:', error);
                         return false;
                     }
                 };
-                const sseSend = (event, data) => {
-                    const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-                    return safeWrite(payload);
-                };
-                if (filteredMentions.length > 0) {
-                    try {
-                        response.writeHead(200, {
-                            'Content-Type': 'text/event-stream',
-                            'Cache-Control': 'no-cache',
-                            Connection: 'keep-alive',
-                            'X-Accel-Buffering': 'no',
-                        });
-                        if (!sseSend('accepted', { messageId: msg.id, content: msg.content })) {
-                            console.error('[SSE] Failed to send accepted event');
-                            response.end();
-                            return;
-                        }
-                        console.log(`[SSE] Starting to process ${filteredMentions.length} nodes:`, filteredMentions);
-                        for (let i = 0; i < filteredMentions.length; i++) {
-                            const nodeKey = filteredMentions[i];
-                            try {
-                                console.log(`[SSE] [${i + 1}/${filteredMentions.length}] Processing node: ${nodeKey}`);
-                                const node = allNodes.find((item) => recordKey(item.configJson) === nodeKey);
-                                if (!node) {
-                                    console.log(`[SSE] Node ${nodeKey} not found, skipping`);
-                                    sseSend('error', { nodeKey, error: 'Node not found' });
-                                    continue;
-                                }
-                                if (node.nodeType === 'checkpoint') {
-                                    console.log(`[SSE] Node ${nodeKey} is checkpoint`);
-                                    try {
-                                        const owner = (await db.select({ currentVersionId: workflows.currentVersionId }).from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
-                                        const workflowVersionId = owner?.currentVersionId ?? undefined;
-                                        await db.insert(nodeMessages).values({ workflowId, workflowVersionId, nodeKey, role: 'user', content: `[群聊] ${content.trim()}`, status: 'completed' }).catch((e) => { console.error('[SSE] Insert user message failed:', e); throw e; });
-                                        await db.insert(nodeMessages).values({ workflowId, workflowVersionId, nodeKey, role: 'assistant', content: '已记下，会写进这次复核说明。', status: 'completed' }).catch((e) => { console.error('[SSE] Insert assistant message failed:', e); throw e; });
-                                        sseSend('message', { nodeKey, type: 'system', content: `${node.name}: 已记下` });
-                                    }
-                                    catch (checkpointError) {
-                                        console.error(`[SSE] Checkpoint error for ${nodeKey}:`, checkpointError);
-                                        sseSend('error', { nodeKey, error: checkpointError instanceof Error ? checkpointError.message : 'Checkpoint failed' });
-                                    }
-                                    continue;
-                                }
-                                const chatKey = `${workflowId}:${nodeKey}`;
-                                let acquired = false;
-                                try {
-                                    acquired = await beginNodeChat(workflowId, nodeKey);
-                                }
-                                catch (lockError) {
-                                    console.error(`[SSE] Lock error for ${nodeKey}:`, lockError);
-                                }
-                                if (!acquired) {
-                                    console.log(`[SSE] Node ${nodeKey} busy, retrying...`);
-                                    for (let attempt = 0; attempt < 5; attempt++) {
-                                        await new Promise((r) => setTimeout(r, 1000));
-                                        try {
-                                            acquired = await beginNodeChat(workflowId, nodeKey);
-                                            if (acquired)
-                                                break;
-                                        }
-                                        catch (retryError) {
-                                            console.error(`[SSE] Retry ${attempt} lock error:`, retryError);
-                                        }
-                                    }
-                                }
-                                if (!acquired) {
-                                    console.log(`[SSE] Node ${nodeKey} still busy, skipping`);
-                                    sseSend('message', { nodeKey, type: 'system', content: `${node.name} 正忙，跳过` });
-                                    continue;
-                                }
-                                console.log(`[SSE] Lock acquired for ${nodeKey}, creating transaction...`);
-                                let created;
-                                try {
-                                    created = await db.transaction(async (tx) => {
-                                        const owner = (await tx.select({ currentVersionId: workflows.currentVersionId }).from(workflows).where(eq(workflows.id, workflowId)).limit(1))[0];
-                                        const workflowVersionId = owner?.currentVersionId ?? undefined;
-                                        const userMsg = await tx.insert(nodeMessages).values({
-                                            workflowId, workflowVersionId, nodeKey,
-                                            role: 'user', content: `[群聊 @你] ${content.trim()}`, status: 'completed'
-                                        });
-                                        const assistantMsg = await tx.insert(nodeMessages).values({
-                                            workflowId, workflowVersionId, nodeKey,
-                                            role: 'assistant', content: '', status: 'streaming'
-                                        });
-                                        const chatMsg = await tx.insert(workflowMessages).values({
-                                            workflowId, workflowRunId, nodeKey,
-                                            type: 'guidance', content: ''
-                                        });
-                                        const runtimeSession = await tx.insert(sessions).values({
-                                            contextType: 'chat',
-                                            contextId: workflowId,
-                                            runtime: 'pi',
-                                            status: 'pending',
-                                            inputJson: { nodeKey, prompt: `[群聊 @你] ${content.trim()}` },
-                                        });
-                                        const sessionId = runtimeSession[0].insertId;
-                                        await tx.update(nodeMessages).set({ sessionId }).where(eq(nodeMessages.id, assistantMsg[0].insertId));
-                                        return {
-                                            assistantMessageId: assistantMsg[0].insertId,
-                                            sessionId,
-                                            chatMessageId: chatMsg[0].insertId
-                                        };
-                                    });
-                                    console.log(`[SSE] Transaction done for ${nodeKey}, chatMessageId=${created.chatMessageId}`);
-                                }
-                                catch (txError) {
-                                    console.error(`[SSE] Transaction failed for ${nodeKey}:`, txError);
-                                    try {
-                                        await endNodeChat(chatKey);
-                                    }
-                                    catch (e) {
-                                        console.error('[SSE] endNodeChat after tx fail:', e);
-                                    }
-                                    sseSend('error', { nodeKey, error: txError instanceof Error ? txError.message : 'Transaction failed' });
-                                    continue;
-                                }
-                                if (!sseSend('stream_start', { nodeKey, name: node.name, chatMessageId: created.chatMessageId })) {
-                                    console.error(`[SSE] Failed to send stream_start for ${nodeKey}`);
-                                    try {
-                                        await endNodeChat(chatKey);
-                                    }
-                                    catch (e) { }
-                                    continue;
-                                }
-                                let lastStreamedContent = '';
-                                const streamUpdate = (text) => {
-                                    if (text === lastStreamedContent)
-                                        return;
-                                    lastStreamedContent = text;
-                                    sseSend('stream_chunk', { nodeKey, chatMessageId: created.chatMessageId, content: text.slice(0, 2000) });
-                                };
-                                try {
-                                    console.log(`[SSE] Calling replyToNode for ${nodeKey}...`);
-                                    await replyToNode(workflowId, nodeKey, `[群聊 @你] ${content.trim()}`, created.assistantMessageId, created.sessionId, streamUpdate);
-                                    console.log(`[SSE] replyToNode completed for ${nodeKey}`);
-                                    const reply = (await db.select({ content: nodeMessages.content }).from(nodeMessages).where(eq(nodeMessages.id, created.assistantMessageId)))[0];
-                                    if (reply?.content?.trim()) {
-                                        await db.update(workflowMessages).set({ content: reply.content.trim().slice(0, 500) }).where(eq(workflowMessages.id, created.chatMessageId)).catch((e) => console.error('[SSE] Update workflow message failed:', e));
-                                        sseSend('stream_done', { nodeKey, chatMessageId: created.chatMessageId, content: reply.content.trim().slice(0, 500) });
-                                    }
-                                    else {
-                                        await db.delete(workflowMessages).where(eq(workflowMessages.id, created.chatMessageId)).catch((e) => console.error('[SSE] Delete empty message failed:', e));
-                                        sseSend('stream_empty', { nodeKey, chatMessageId: created.chatMessageId });
-                                    }
-                                }
-                                catch (replyError) {
-                                    const errorMsg = replyError instanceof Error ? replyError.message : 'Agent 没有回复';
-                                    console.error(`[SSE] replyToNode error for ${nodeKey}:`, replyError);
-                                    await db.update(nodeMessages).set({ content: errorMsg, status: 'failed' })
-                                        .where(eq(nodeMessages.id, created.assistantMessageId))
-                                        .catch((e) => console.error('[SSE] Update node message status failed:', e));
-                                    await db.update(sessions).set({ status: 'failed', outputJson: { error: errorMsg }, completedAt: new Date() })
-                                        .where(eq(sessions.id, created.sessionId))
-                                        .catch((e) => console.error('[SSE] Update session status failed:', e));
-                                    await db.update(workflowMessages).set({ type: 'system', content: `⚠️ ${nodeKey}: ${errorMsg}` })
-                                        .where(eq(workflowMessages.id, created.chatMessageId))
-                                        .catch((e) => console.error('[SSE] Update workflow message type failed:', e));
-                                    sseSend('stream_error', { nodeKey, chatMessageId: created.chatMessageId, error: errorMsg });
-                                }
-                                finally {
-                                    try {
-                                        await endNodeChat(chatKey);
-                                    }
-                                    catch (e) {
-                                        console.error('[SSE] endNodeChat finally error:', e);
-                                    }
-                                }
-                            }
-                            catch (nodeError) {
-                                const errorMsg = nodeError instanceof Error ? nodeError.message : 'Unknown node error';
-                                console.error(`[SSE] Unexpected error processing node ${nodeKey}:`, nodeError);
-                                sseSend('error', { nodeKey, error: errorMsg });
-                            }
-                        }
-                        console.log(`[SSE] All nodes processed, sending done event`);
+                response.socket?.setNoDelay(true);
+                response.writeHead(200, {
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    Connection: 'keep-alive',
+                    'X-Accel-Buffering': 'no',
+                });
+                response.write(':\n\n');
+                const named = (nodeKey) => chatable.find((node) => node.key === nodeKey)?.name
+                    ?? checkpoints.find((node) => node.key === nodeKey)?.name
+                    ?? nodeKey;
+                try {
+                    if (route.kind === 'checkpoint') {
+                        await streamCheckpointAck(workflowId, workflowRunId, route.nodeKey, named(route.nodeKey), content.trim(), sseSend);
                         sseSend('done', {});
+                        return;
                     }
-                    catch (outerError) {
-                        console.error('[SSE] Fatal error in SSE handler:', outerError);
-                        try {
-                            safeWrite(`event: fatal_error\ndata: ${JSON.stringify({ error: outerError instanceof Error ? outerError.message : 'Unknown error' })}\n\n`);
-                        }
-                        catch (e) {
-                            console.error('[SSE] Cannot send fatal_error event:', e);
-                        }
+                    if (route.kind === 'conductor' || route.kind === 'busy') {
+                        const nodeKeys = route.kind === 'busy' ? [route.nodeKey] : route.nodeKeys;
+                        await streamAdminReply(workflowId, workflowRunId, nodeKeys, content.trim(), sseSend);
+                        sseSend('done', {});
+                        return;
                     }
-                    finally {
-                        console.log('[SSE] Ending response');
-                        try {
-                            response.end();
+                    if (route.kind === 'broadcast') {
+                        for (const reply of route.replies) {
+                            if (reply.kind === 'checkpoint') {
+                                await streamCheckpointAck(workflowId, workflowRunId, reply.nodeKey, named(reply.nodeKey), content.trim(), sseSend);
+                            }
+                            else {
+                                await streamDirectGroupReply(workflowId, workflowRunId, reply.nodeKey, named(reply.nodeKey), content.trim(), false, sseSend);
+                            }
                         }
-                        catch (e) {
-                            console.error('[SSE] Response end error:', e);
+                        if (route.busyKeys.length > 0) {
+                            await streamAdminReply(workflowId, workflowRunId, route.busyKeys, content.trim(), sseSend);
                         }
+                        sseSend('done', {});
+                        return;
                     }
-                    return;
+                    await streamDirectGroupReply(workflowId, workflowRunId, route.nodeKey, named(route.nodeKey), content.trim(), true, sseSend);
+                    sseSend('done', {});
                 }
-                return sendJson(response, 202, { status: 'accepted', data: msg });
+                catch (error) {
+                    const message = error instanceof Error ? error.message : '回复失败';
+                    sseSend('stream_error', { nodeKey: GROUP_ADMIN_KEY, error: message });
+                    sseSend('done', {});
+                }
+                finally {
+                    try {
+                        response.end();
+                    }
+                    catch { /* already closed */ }
+                }
+                return;
+            }
+            if (request.method === 'DELETE') {
+                await db.delete(workflowMessages).where(eq(workflowMessages.workflowId, workflowId));
+                return sendJson(response, 200, { status: 'cleared' });
             }
         }
         const workflowFileMatch = url.pathname.match(/^\/api\/workflows\/(\d+)\/files$/);
@@ -4754,6 +4948,12 @@ async function handler(request, response) {
                 await assertResumePossible(workflowRunId, run.workflowId);
             }
             requireRunTransition(run.status, 'running');
+            const currentInput = await runInput(workflowRunId);
+            if (currentInput.focusKeys) {
+                const nextInput = { ...currentInput };
+                delete nextInput.focusKeys;
+                await db.update(workflowRuns).set({ inputJson: nextInput }).where(eq(workflowRuns.id, workflowRunId));
+            }
             if (executingWorkflowRuns.has(workflowRunId)) {
                 return sendJson(response, 409, { error: '当前 Run 正在运行，请先停止后再执行' });
             }
