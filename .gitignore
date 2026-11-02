@@ -1,7 +1,14 @@
+# 环境变量：真实凭证不入库，模板文件入库
 .env
+.env.local
+.env.*.local
+!.env.example
 node_modules/
 web/node_modules/
 web/.next/
 dist/
+*.tsbuildinfo
 .DS_Store
 *.log
+.idea
+.cursor

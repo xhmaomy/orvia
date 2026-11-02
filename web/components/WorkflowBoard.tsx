@@ -3,6 +3,7 @@
 import { CSSProperties, FormEvent, memo, PointerEvent as ReactPointerEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { beijingClock } from '../lib/beijing-time';
 import { useAutoDismiss } from '../lib/use-auto-dismiss';
+import { WorkflowChat } from './WorkflowChat';
 
 type Id = number;
 export type BoardNode = { key: string; name: string; type: 'task' | 'checkpoint' | 'start' | 'end'; capabilities: string[]; skills: string[]; modelId: number | null; question: string; instruction: string; outputRequirement: string; acceptanceRule: string; maxRedos: number; requirement: string; x: number; y: number; w: number; h: number };
@@ -388,9 +389,10 @@ export type WorkflowVersionOption = { id: number; version: string; seq: number; 
 
 export function WorkflowBoard({
   mode, name, version, versions, currentVersionId, nodes, edges, loops, capabilities, skills, providers, models, events, progress, failures, checks, deliverables, reviewHistories, directory, runStatus, runStatusCode,
-  onClose, onName, onSelectVersion, onNodes, onEdges, onLoops, onPersist, onPublish, onExecute, onStop, onOpenDirectory, onOpenDeliverable, onLoadSummary, onReadFile, onListFiles, onUploadFile, onDeleteFile,
+  onClose, onName, onSelectVersion, onNodes, onEdges, onLoops, onPersist, onPublish, onExecute, onRunFromStart, onStop, onOpenDirectory, onOpenDeliverable, onLoadSummary, onReadFile, onListFiles, onUploadFile, onDeleteFile,
   decisions, decisionNotes, onDecisionNote, onResolveDecision,
   chatNode, chatMessages, chatError, onOpenChat, onCloseChat, onSendChat, onStopChat,
+  workflowId, workflowMessages, onRefreshMessages,
 }: {
   mode: 'create' | 'view';
   name: string;
@@ -422,6 +424,8 @@ export function WorkflowBoard({
   onPersist: (nodes: BoardNode[], edges: BoardEdge[], silent?: boolean, loops?: BoardLoop[]) => Promise<boolean>;
   onPublish: () => void;
   onExecute: () => void;
+  /** 从第一个节点开始执行；返回 null 表示成功，返回文案表示失败原因 */
+  onRunFromStart: () => Promise<string | null>;
   onStop: () => Promise<boolean>;
   decisions?: BoardDecision[];
   decisionNotes?: Record<number, string>;
@@ -445,6 +449,19 @@ export function WorkflowBoard({
   onCloseChat: () => void;
   onSendChat: (content: string) => void | Promise<boolean>;
   onStopChat: () => void | Promise<void>;
+  workflowId: number;
+  workflowMessages?: Array<{
+    id: number;
+    workflowId: number;
+    workflowRunId: number | null;
+    nodeKey: string | null;
+    type: 'started' | 'progress' | 'completed' | 'failed' | 'review' | 'decision' | 'redo' | 'guidance' | 'system';
+    content: string;
+    mentionsJson: string[] | null;
+    attachmentsJson: Array<{ name: string; path: string }> | null;
+    createdAt: string;
+  }>;
+  onRefreshMessages?: () => void;
 }) {
   const boardRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -453,6 +470,7 @@ export function WorkflowBoard({
   const chatRef = useRef<HTMLDivElement>(null);
   const chatStickBottom = useRef(true);
   const [chatFold, setChatFold] = useState(0);
+  const [viewMode, setViewMode] = useState<'canvas' | 'chat'>('canvas');
   function sendChat(text: string) {
     if (text.trim()) {
       chatStickBottom.current = true;
@@ -937,6 +955,8 @@ export function WorkflowBoard({
       )}</label>
       <label className="board-root">主目录<button type="button" title={directory || '打开主目录'} onClick={() => void onOpenDirectory()}>{directory || '打开主目录'}</button></label>
       <div className="run-controls board-bar-actions">
+        <button type="button" className={`view-toggle${viewMode === 'canvas' ? ' active' : ''}`} onClick={() => setViewMode('canvas')}>📐 画布</button>
+        <button type="button" className={`view-toggle${viewMode === 'chat' ? ' active' : ''}`} onClick={() => setViewMode('chat')}>💬 群聊</button>
         <button type="button" onClick={() => { if (!guardEdit()) return; onPublish(); }} disabled={running}>{editable ? '发布 Workflow' : '发布'}</button>
         <button type="button" onClick={() => void (async () => {
           if (canEdit) await onPersist(nodesRef.current, edgesRef.current, true);
@@ -945,7 +965,9 @@ export function WorkflowBoard({
       </div>
     </header>
     <div className={`board-body${chatNode ? ' with-chat' : ''}`} style={{ '--chat-width': `${chatWidth}px` } as CSSProperties}>
-      <div className="board-stage">
+      {viewMode === 'chat' ? <div className="board-stage chat-stage">
+        <WorkflowChat workflowId={workflowId} messages={workflowMessages ?? []} nodes={nodes.map((n) => ({ key: n.key, name: n.name, type: n.type }))} onOpenChat={onOpenChat} onOpenDeliverable={async (dir) => { await onOpenDeliverable(dir); }} onRefresh={onRefreshMessages} onRunFromStart={onRunFromStart} running={running} />
+      </div> : <div className="board-stage">
         <div className="panel-head">
           {runStatusCode === 'awaiting_decision'
             ? <h3>等待人工复核：点高亮节点上的「待确认」，或点节点打开批准/重做</h3>
@@ -1184,7 +1206,7 @@ export function WorkflowBoard({
           })()}
         </div>
         </div>
-      </div>
+      </div>}
       {chatNode ? <div className="pane-resize" role="separator" aria-orientation="vertical" aria-label="调整对话宽度" onPointerDown={startPaneResize} onPointerMove={movePaneResize} onPointerUp={endPaneResize} onPointerCancel={endPaneResize} /> : null}
       {chatNode ? <aside className="node-chat" aria-label={`${chatNode.name}的对话`}>
         <div className="panel-head"><h3>{chatNode.name || (chatNode.type === 'task' ? '未命名 Agent' : '未命名')}</h3><button type="button" onClick={onCloseChat}>关闭</button></div>
@@ -1214,7 +1236,7 @@ export function WorkflowBoard({
         {editor.type === 'start' ? <label>需求文件<input type="file" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; if (!file) return; void onUploadFile(file).then(() => onListFiles()).then((result) => { setInputFiles(result.files); setInputDirectory(result.directory); }).catch((cause) => setNodeError(cause instanceof Error ? cause.message : '上传失败')); }} /></label> : null}
         {editor.type === 'start' && inputDirectory ? <p className="muted">文件目录：{inputDirectory}</p> : null}
         {editor.type === 'start' && inputFiles.length ? <div className="picked-list">{inputFiles.map((file) => <div className="picked-item" key={file.name}><span>{file.name}</span><button type="button" onClick={() => void onDeleteFile(file.name).then(() => onListFiles()).then((result) => setInputFiles(result.files)).catch((cause) => setNodeError(cause instanceof Error ? cause.message : '删除失败'))}>移除</button></div>)}</div> : null}
-        {editor.type === 'task' ? <CapabilityPicker label="能力" hint="从下拉里选择，至少一项。协作时按这些能力理解这个 Agent。" options={capabilities} selected={editor.capabilities} onChange={(next) => setEditor({ ...editor, capabilities: next })} /> : null}
+        {editor.type === 'task' ? <CapabilityPicker label="能力" hint="从下拉里选择，至少一项。协作时按这些能力理解这个 Agent。" options={capabilities} selected={editor.capabilities} onChange={(next) => { const descLines = next.map((key) => capabilities.find((c) => c.key === key)?.description).filter((d): d is string => !!d); const autoInstruction = descLines.join('\n'); const prevDescLines = editor.capabilities.map((key) => capabilities.find((c) => c.key === key)?.description).filter((d): d is string => !!d); const prevAutoInstruction = prevDescLines.join('\n'); const instruction = editor.instruction === prevAutoInstruction || !editor.instruction ? autoInstruction : editor.instruction; setEditor({ ...editor, capabilities: next, instruction }); }} /> : null}
         {editor.type === 'task' ? <SkillPicker label="Skill" hint="可选。例如勾选「网络访问」后，这个节点执行时可以搜索网页并抓取 URL。目录在「Skill 管理」维护。" options={skills} selected={editor.skills} onChange={(next) => setEditor({ ...editor, skills: next })} /> : null}
         {editor.type === 'task' ? <>
           <label>Provider<select value={editor.providerId} onChange={(event) => {

@@ -287,6 +287,8 @@ export const events = mysqlTable('ov_events', {
   projectId: int('project_id').notNull().references(() => projects.id),
   workflowRunId: int('workflow_run_id').references(() => workflowRuns.id),
   workflowVersionId: int('workflow_version_id'),
+  /** 事件所属的执行轮次（Plan）。从头开始会新建 Plan，用它把退回记录按轮次隔开 */
+  planId: int('plan_id').references(() => plans.id),
   taskId: int('task_id').references(() => tasks.id),
   sessionId: int('session_id').references(() => sessions.id),
   agentId: int('agent_id').references(() => agents.id),
@@ -295,6 +297,21 @@ export const events = mysqlTable('ov_events', {
   createdAt: timestamp('created_at').default(sql`CURRENT_TIMESTAMP`).notNull(),
 }, (table) => ({
   eventsVersionIdx: index('events_version_idx').on(table.workflowVersionId),
+  eventsPlanIdx: index('events_plan_idx').on(table.planId),
+}));
+
+export const workflowMessages = mysqlTable('ov_workflow_messages', {
+  id: int('id').autoincrement().primaryKey(),
+  workflowId: int('workflow_id').notNull().references(() => workflows.id),
+  workflowRunId: int('workflow_run_id').references(() => workflowRuns.id),
+  nodeKey: varchar('node_key', { length: 160 }),
+  type: mysqlEnum('message_type', ['started', 'progress', 'completed', 'failed', 'review', 'decision', 'redo', 'guidance', 'system']).notNull(),
+  content: text('content').notNull(),
+  mentionsJson: json('mentions_json'),
+  attachmentsJson: json('attachments_json'),
+  createdAt: timestamp('created_at').default(sql`CURRENT_TIMESTAMP`).notNull(),
+}, (table) => ({
+  workflowRunIdx: index('workflow_messages_run_idx').on(table.workflowId, table.workflowRunId),
 }));
 
 export const decisions = mysqlTable('ov_decisions', {

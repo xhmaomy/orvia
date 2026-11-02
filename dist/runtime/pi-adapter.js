@@ -1,21 +1,73 @@
 import { spawn } from 'node:child_process';
+function describePiTool(toolName) {
+    if (toolName === 'read' || toolName === 'grep' || toolName === 'find' || toolName === 'ls')
+        return '正在查看这个 Agent 的文件…';
+    if (toolName === 'edit' || toolName === 'write')
+        return '正在按指导修改这个 Agent 的文件…';
+    if (toolName === 'bash' || toolName === 'powershell')
+        return '正在这个 Agent 的目录里执行命令…';
+    return '正在处理你的指导…';
+}
+/** 显式传了 --api-key 时清掉常见环境变量，避免 Pi 仍走本机默认凭证 */
+const PI_AUTH_ENV_KEYS = [
+    'OPENAI_API_KEY',
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_AUTH_TOKEN',
+    'GOOGLE_API_KEY',
+    'GEMINI_API_KEY',
+    'OPENROUTER_API_KEY',
+    'MINIMAX_API_KEY',
+    'MINIMAX_API_TOKEN',
+    'MINIMAX_GROUP_ID',
+    'API_KEY',
+    'PI_API_KEY',
+];
+function environmentForPi(input) {
+    const env = { ...process.env, ...input.environment };
+    if (input.apiKey) {
+        for (const key of PI_AUTH_ENV_KEYS)
+            delete env[key];
+    }
+    return env;
+}
+export function redactPiArgs(args) {
+    const next = [...args];
+    for (let index = 0; index < next.length - 1; index += 1) {
+        if (next[index] === '--api-key')
+            next[index + 1] = '***';
+    }
+    return next;
+}
 export function parsePiOutputLine(line) {
     try {
         const event = JSON.parse(line);
         if (!event || typeof event !== 'object' || typeof event.type !== 'string') {
             return { handled: false };
         }
+        if (event.type === 'message_update' && event.assistantMessageEvent?.type === 'thinking_delta' && typeof event.assistantMessageEvent.delta === 'string') {
+            return { handled: true, thinkingDelta: event.assistantMessageEvent.delta };
+        }
+        if (event.type === 'message_update' && event.assistantMessageEvent?.type === 'thinking_end' && typeof event.assistantMessageEvent.content === 'string') {
+            return { handled: true, finalThinking: event.assistantMessageEvent.content };
+        }
         if (event.type === 'message_update'
             && event.assistantMessageEvent?.type === 'text_delta'
             && typeof event.assistantMessageEvent.delta === 'string') {
             return { handled: true, textDelta: event.assistantMessageEvent.delta };
+        }
+        if (event.type === 'tool_execution_start' && typeof event.toolName === 'string') {
+            return { handled: true, activity: describePiTool(event.toolName) };
         }
         if (event.type === 'message_end' && event.message?.role === 'assistant') {
             const finalText = event.message.content
                 ?.filter((content) => content.type === 'text' && typeof content.text === 'string')
                 .map((content) => content.text)
                 .join('');
-            return { handled: true, finalText };
+            const finalThinking = event.message.content
+                ?.filter((content) => content.type === 'thinking' && typeof content.thinking === 'string')
+                .map((content) => content.thinking)
+                .join('');
+            return { handled: true, finalText, ...(finalThinking ? { finalThinking } : {}) };
         }
         return { handled: true };
     }
@@ -44,10 +96,13 @@ export class PiRuntimeAdapter {
         this.results.delete(input.sessionId);
         const command = input.command ?? process.env.PI_COMMAND ?? 'pi';
         const args = ['--print', '--mode', 'json', '--no-session'];
-        if (input.provider)
-            args.push('--provider', input.provider);
-        if (input.model)
-            args.push('--model', input.model);
+        // 节点级模型：必须成套传入，避免只传了 model 却仍用 Pi 本机默认 key
+        if (input.provider || input.model || input.apiKey) {
+            if (!input.provider?.trim() || !input.model?.trim() || !input.apiKey?.trim()) {
+                throw new Error('启动 Pi 需要同时提供节点配置的 provider、model 和 apiKey');
+            }
+            args.push('--provider', input.provider.trim(), '--model', input.model.trim(), '--api-key', input.apiKey.trim());
+        }
         if (input.systemPrompt)
             args.push('--system-prompt', input.systemPrompt);
         if (input.allowedTools) {
@@ -59,10 +114,17 @@ export class PiRuntimeAdapter {
         if (input.deniedTools && input.deniedTools.length > 0) {
             args.push('--exclude-tools', input.deniedTools.join(','));
         }
+        if (input.disableDefaultSkills || (input.skillPaths && input.skillPaths.length > 0)) {
+            args.push('--no-skills');
+        }
+        for (const skillPath of input.skillPaths ?? []) {
+            if (skillPath.trim())
+                args.push('--skill', skillPath.trim());
+        }
         args.push('--', input.prompt ?? 'Continue the assigned Orvia task.');
         const child = spawn(command, args, {
             cwd: input.workingDirectory,
-            env: { ...process.env, ...input.environment },
+            env: environmentForPi(input),
             shell: false,
             stdio: ['ignore', 'pipe', 'pipe'],
         });
@@ -74,7 +136,9 @@ export class PiRuntimeAdapter {
         };
         let stdoutBuffer = '';
         let sawTextDelta = false;
+        let sawThinkingDelta = false;
         let finalText = '';
+        let finalThinking = '';
         const consumeStdoutLine = (line) => {
             if (!line)
                 return;
@@ -83,12 +147,20 @@ export class PiRuntimeAdapter {
                 emit({ sessionId: input.sessionId, type: 'stdout', payload: `${line}\n` });
                 return;
             }
+            if (parsed.thinkingDelta !== undefined) {
+                sawThinkingDelta = true;
+                emit({ sessionId: input.sessionId, type: 'thinking', payload: parsed.thinkingDelta });
+            }
             if (parsed.textDelta !== undefined) {
                 sawTextDelta = true;
                 emit({ sessionId: input.sessionId, type: 'stdout', payload: parsed.textDelta });
             }
+            if (parsed.activity)
+                emit({ sessionId: input.sessionId, type: 'activity', payload: parsed.activity });
             if (parsed.finalText !== undefined)
                 finalText = parsed.finalText;
+            if (parsed.finalThinking !== undefined)
+                finalThinking = parsed.finalThinking;
         };
         child.stdout.on('data', (chunk) => {
             stdoutBuffer += chunk.toString('utf8');
@@ -97,24 +169,37 @@ export class PiRuntimeAdapter {
             for (const line of lines)
                 consumeStdoutLine(line);
         });
+        let stderrText = '';
         child.stderr.on('data', (chunk) => {
-            emit({ sessionId: input.sessionId, type: 'stderr', payload: chunk.toString('utf8') });
+            const text = chunk.toString('utf8');
+            stderrText += text;
+            emit({ sessionId: input.sessionId, type: 'stderr', payload: text });
         });
         let spawnError;
         child.once('error', (error) => { spawnError = error; });
         child.once('close', (code, signal) => {
             if (stdoutBuffer)
                 consumeStdoutLine(stdoutBuffer);
+            if (!sawThinkingDelta && finalThinking) {
+                emit({ sessionId: input.sessionId, type: 'thinking', payload: finalThinking });
+            }
             if (!sawTextDelta && finalText) {
                 emit({ sessionId: input.sessionId, type: 'stdout', payload: finalText });
             }
             const status = code === 0 && !spawnError ? 'completed' : 'failed';
+            const stderrHint = stderrText.replace(/\s+/g, ' ').trim().slice(0, 500);
+            const message = status === 'failed'
+                ? (spawnError?.message
+                    ?? (signal ? `Pi 进程被信号 ${signal} 终止` : undefined)
+                    ?? (stderrHint || undefined)
+                    ?? (typeof code === 'number' ? `Pi 进程退出码 ${code}` : 'Pi 执行失败'))
+                : undefined;
             const result = {
                 sessionId: input.sessionId,
                 status,
                 runtime: this.name,
                 pid: child.pid,
-                message: spawnError?.message ?? (signal ? `Pi exited with signal ${signal}` : undefined),
+                message,
             };
             this.statuses.set(input.sessionId, status);
             this.results.set(input.sessionId, result);
@@ -126,10 +211,20 @@ export class PiRuntimeAdapter {
             emit({
                 sessionId: input.sessionId,
                 type: status,
-                payload: { code, signal },
+                payload: status === 'failed' ? { code, signal, error: message } : { code, signal },
             });
         });
-        emit({ sessionId: input.sessionId, type: 'started', payload: { pid: child.pid, command, args } });
+        emit({
+            sessionId: input.sessionId,
+            type: 'started',
+            payload: {
+                pid: child.pid,
+                command,
+                args: redactPiArgs(args),
+                provider: input.provider ?? null,
+                model: input.model ?? null,
+            },
+        });
         return {
             sessionId: input.sessionId,
             status: 'running',

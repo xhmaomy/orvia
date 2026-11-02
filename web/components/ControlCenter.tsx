@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { beijingDateTime } from '../lib/beijing-time';
+import { activePlanId, eventInCurrentRound } from '../lib/run-round';
 import { useAutoDismiss } from '../lib/use-auto-dismiss';
 import { WorkflowBoard, graphFromStored, type NodeCheck, type SummaryNode, type WorkflowVersionOption } from './WorkflowBoard';
 
@@ -16,7 +17,7 @@ type WorkflowNodeDraft = { key: string; name: string; type: 'task' | 'checkpoint
 type WorkflowLoop = { key: string; nodeKeys: string[]; maxIterations: number };
 type Workflow = { id: Id; name: string; version: string; status: string; runStatus?: string | null; definitionJson?: unknown; projectId?: Id; projectName?: string; createdAt?: string; updatedAt?: string };
 type Run = { id: Id; workflowId: Id; status: string; currentPlanVersion?: number; startedAt?: string; completedAt?: string; errorJson?: unknown };
-type EventRow = { id: Id; type: string; payloadJson?: unknown; payload?: unknown; createdAt?: string; occurredAt?: string; workflowRunId?: Id; taskId?: Id | null };
+type EventRow = { id: Id; type: string; payloadJson?: unknown; payload?: unknown; createdAt?: string; occurredAt?: string; workflowRunId?: Id; taskId?: Id | null; planId?: Id | null };
 type Center = { counts: Record<string, number>; recentEvents: EventRow[] };
 type Decision = {
   id: Id;
@@ -184,18 +185,23 @@ function eventPayloadMessage(event: EventRow): string {
   }
   return '';
 }
-function nodeChecks(tasks: AnyRow[] | undefined, events?: EventRow[]): Record<string, NodeCheck> {
+function nodeChecks(tasks: AnyRow[] | undefined, events?: EventRow[], plans?: AnyRow[]): Record<string, NodeCheck> {
   const checks: Record<string, NodeCheck> = {};
   const keyByTaskId = new Map<number, string>();
   const storedRejectKeys = new Set<string>();
+  const currentTaskIds = new Set<number>();
   for (const task of [...(tasks ?? [])].sort((left, right) => left.id - right.id)) {
     const input = task.inputJson;
     const record = input && typeof input === 'object' ? input as Record<string, unknown> : {};
     const key = typeof record.key === 'string' ? record.key : '';
-    if (key && typeof task.id === 'number') keyByTaskId.set(task.id, key);
     if (task.status === 'cancelled') {
       if (key) delete checks[key];
       continue;
+    }
+    // 只登记本轮未取消的任务，避免旧轮次任务把历史退回事件挂到节点上
+    if (key && typeof task.id === 'number') {
+      keyByTaskId.set(task.id, key);
+      currentTaskIds.add(task.id);
     }
     if (!key) continue;
     const current = acceptanceEntry(record.acceptanceResult);
@@ -205,9 +211,11 @@ function nodeChecks(tasks: AnyRow[] | undefined, events?: EventRow[]): Record<st
     if (current) checks[key] = { ...current, history: history.length ? history : current.verdict === 'reject' ? [current] : [] };
     else delete checks[key];
   }
+  const planId = activePlanId(tasks, plans);
   // 旧数据没有 acceptanceHistory 时，从退回事件补到已有结果的 history（不凭空造角标）
   for (const event of events ?? []) {
     if (event.type !== 'acceptance.returned') continue;
+    if (!eventInCurrentRound(event, planId, currentTaskIds)) continue;
     const key = typeof event.taskId === 'number' ? keyByTaskId.get(event.taskId) : undefined;
     if (!key || storedRejectKeys.has(key)) continue;
     const check = checks[key];
@@ -349,7 +357,11 @@ export default function ControlCenter() {
   const [nodeMessages, setNodeMessages] = useState<Array<{ id: Id; role: string; content: string; thinking?: string | null; status: string }>>([]);
   const [chatError, setChatError] = useState('');
   const [chatTick, setChatTick] = useState(0);
+  const [workflowChatMessages, setWorkflowChatMessages] = useState<Array<{ id: Id; workflowId: Id; workflowRunId: Id | null; nodeKey: string | null; type: 'started' | 'progress' | 'completed' | 'failed' | 'review' | 'decision' | 'redo' | 'guidance' | 'system'; content: string; mentionsJson: string[] | null; attachmentsJson: Array<{ name: string; path: string }> | null; createdAt: string }>>([]);
   const inflight = useRef(false);
+  /** act() 最近一次失败的文案，供调用方拿到具体原因 */
+  const actError = useRef('');
+  const chatRefreshSeq = useRef(0);
   const boardOpen = useRef(false);
   const progressSync = useRef(false);
   const progressFloor = useRef<number | null>(null);
@@ -595,9 +607,9 @@ export default function ControlCenter() {
           return sameFailures(baseline, failures) ? current : failures;
         });
         const eventRows = [...(runDetail?.events ?? []), ...liveEvents.filter((event) => event.workflowRunId === runId)];
-        const checks = nodeChecks(tasks, eventRows);
+        const checks = nodeChecks(tasks, eventRows, runDetail?.plans);
         setLiveChecks((current) => {
-          const baseline = current ?? nodeChecks(runDetail?.tasks, eventRows);
+          const baseline = current ?? nodeChecks(runDetail?.tasks, eventRows, runDetail?.plans);
           return sameChecks(baseline, checks) ? current : checks;
         });
         const deliverables = nodeDeliverables(tasks);
@@ -614,7 +626,9 @@ export default function ControlCenter() {
           progressSync.current = false;
           setRunDetail((current) => {
             if (!current) return current;
-            if (['failed', 'completed', 'cancelled'].includes(current.status) && !anyRunning) return current;
+            // 只要有 pending/running 任务就把 Run 视为运行中；
+            // 终态里出现 pending 说明正在重新执行（比如从群聊启动 focus），
+            // 群聊进度轮询依赖这个状态才会启动
             return current.status !== 'running' ? { ...current, status: 'running' } : current;
           });
           return;
@@ -631,6 +645,27 @@ export default function ControlCenter() {
     return () => { stopped = true; window.clearInterval(timer); };
   }, [board, runId, loadRun, runDetail?.tasks, runDetail?.events, liveEvents]);
 
+  // 群聊时间线：Run 执行期间后端会陆续写入「开始执行 / 进展 / 完成」等消息，
+  // 但节点跑的过程中没有对应的 SSE 事件，这里按 2s 轮询把最新消息拉回群聊
+  useEffect(() => {
+    if (!board || !workflowId || !runId) return;
+    const status = runDetail?.status;
+    if (!status || !['pending', 'running', 'paused', 'awaiting_decision'].includes(status)) return;
+    let stopped = false;
+    const poll = async () => {
+      try {
+        const msgResult = await request<{ data: Array<{ id: Id; workflowId: Id; workflowRunId: Id | null; nodeKey: string | null; type: 'started' | 'progress' | 'completed' | 'failed' | 'review' | 'decision' | 'redo' | 'guidance' | 'system'; content: string; mentionsJson: string[] | null; attachmentsJson: Array<{ name: string; path: string }> | null; createdAt: string }> }>(`/api/workflows/${workflowId}/messages`);
+        if (stopped) return;
+        setWorkflowChatMessages((current) => (
+          current.length === msgResult.data.length && current.at(-1)?.id === msgResult.data.at(-1)?.id
+        ) ? current : msgResult.data);
+      } catch { /* 轮询失败时保留上一次的消息 */ }
+    };
+    void poll();
+    const timer = window.setInterval(() => { void poll(); }, 2000);
+    return () => { stopped = true; window.clearInterval(timer); };
+  }, [board, workflowId, runId, runDetail?.status]);
+
   useEffect(() => {
     if (!projectId) { setSse('idle'); return; }
     setSse('connecting');
@@ -644,7 +679,12 @@ export default function ControlCenter() {
         || event.type === 'checkpoint.pending'
         || event.type === 'acceptance.pending'
         || event.type === 'task.failed';
-      if (runId && event.workflowRunId === runId && (!boardOpen.current || runEnded)) void loadRun(runId);
+      const runStarted = event.type === 'workflow.started';
+      if (runId && event.workflowRunId === runId && (runStarted || !boardOpen.current || runEnded)) void loadRun(runId);
+      const chatRelevant = event.type === 'workflow.started' || event.type === 'task.completed' || event.type === 'task.failed' || event.type === 'checkpoint.pending' || event.type === 'workflow.completed' || event.type === 'workflow.failed' || (typeof event.type === 'string' && event.type.startsWith('decision.'));
+      if (chatRelevant && workflowId && boardOpen.current) {
+        void (async () => { try { const msgResult = await request<{ data: Array<{ id: Id; workflowId: Id; workflowRunId: Id | null; nodeKey: string | null; type: 'started' | 'progress' | 'completed' | 'failed' | 'review' | 'decision' | 'redo' | 'guidance' | 'system'; content: string; mentionsJson: string[] | null; attachmentsJson: Array<{ name: string; path: string }> | null; createdAt: string }> }>(`/api/workflows/${workflowId}/messages`); setWorkflowChatMessages(msgResult.data); } catch { /* ignore */ } })();
+      }
     };
     const source = new EventSource(`${API_URL}/api/events/stream?projectId=${projectId}${tokenQuery}`);
     source.addEventListener('ready', () => setSse('open'));
@@ -663,7 +703,7 @@ export default function ControlCenter() {
       } catch { /* malformed websocket frame */ }
     };
     return () => { source.close(); socket.close(); setSse('idle'); };
-  }, [projectId, runId, loadRun, token]);
+  }, [projectId, workflowId, runId, loadRun, token]);
 
   const project = projects.find((item) => item.id === projectId);
   const pendingDecisions = decisions.filter((item) => item.status === 'pending');
@@ -673,11 +713,13 @@ export default function ControlCenter() {
     if (inflight.current) {
       setNotice('');
       setError('上一个操作还在进行，请稍候');
+      actError.current = '上一个操作还在进行，请稍候';
       return false;
     }
     inflight.current = true;
+    actError.current = '';
     setError(''); setNotice('');
-    try { await task(); setNotice(success); setState('ready'); return true; } catch (cause) { fail(cause); return false; } finally { inflight.current = false; }
+    try { await task(); setNotice(success); setState('ready'); return true; } catch (cause) { fail(cause); actError.current = cause instanceof Error ? cause.message : '操作失败'; return false; } finally { inflight.current = false; }
   }
   async function refresh() {
     await loadGlobal();
@@ -1069,6 +1111,15 @@ export default function ControlCenter() {
       await applyVersionSwitch(versionId);
     }, '已切换到历史版本');
   }
+  async function loadChatMessages() {
+    if (!workflowId) return;
+    const seq = ++chatRefreshSeq.current;
+    try {
+      const msgResult = await request<{ data: Array<{ id: Id; workflowId: Id; workflowRunId: Id | null; nodeKey: string | null; type: 'started' | 'progress' | 'completed' | 'failed' | 'review' | 'decision' | 'redo' | 'guidance' | 'system'; content: string; mentionsJson: string[] | null; attachmentsJson: Array<{ name: string; path: string }> | null; createdAt: string }> }>(`/api/workflows/${workflowId}/messages`);
+      if (seq !== chatRefreshSeq.current) return;
+      setWorkflowChatMessages(msgResult.data);
+    } catch { /* ignore */ }
+  }
   async function openWorkflowBoard(id: Id, preferredRunId?: Id | null) {
     try {
       const workflow = workflows.find((item) => item.id === id);
@@ -1093,6 +1144,10 @@ export default function ControlCenter() {
       const runRows = await list<Run>(`/api/workflow-runs?workflowId=${id}`);
       setRuns(runRows);
       setRunId(preferredRunId && runRows.some((item) => item.id === preferredRunId) ? preferredRunId : (runRows.at(-1)?.id ?? null));
+      try {
+        const msgResult = await request<{ data: Array<{ id: Id; workflowId: Id; workflowRunId: Id | null; nodeKey: string | null; type: 'started' | 'progress' | 'completed' | 'failed' | 'review' | 'decision' | 'redo' | 'guidance' | 'system'; content: string; mentionsJson: string[] | null; attachmentsJson: Array<{ name: string; path: string }> | null; createdAt: string }> }>(`/api/workflows/${id}/messages`);
+        setWorkflowChatMessages(msgResult.data);
+      } catch { setWorkflowChatMessages([]); }
       setError('');
     } catch (cause) { fail(cause, 'Workflow 打开失败'); }
   }
@@ -1195,12 +1250,13 @@ export default function ControlCenter() {
       if (workflowId) await loadRuns(workflowId);
     }, 'Run 已停止，现在可以编辑 Agent');
   }
-  async function runAction(action: 'execute' | 'pause' | 'resume' | 'replan', mode?: 'restart' | 'resume') {
+  /** 返回 null 表示成功；返回文案表示失败原因 */
+  async function runAction(action: 'execute' | 'pause' | 'resume' | 'replan', mode?: 'restart' | 'resume'): Promise<string | null> {
     if (action === 'execute') {
       if (runId && runDetail?.status === 'running') {
         setError('当前 Run 正在运行，请先停止后再执行');
         setState('error');
-        return;
+        return '当前 Run 正在运行，请先停止后再执行';
       }
       const start = workflowNodesForm.find((node) => node.type === 'start');
       if (start && board && workflowId) {
@@ -1209,20 +1265,20 @@ export default function ControlCenter() {
           if (!start.requirement.trim() && files.files.length === 0) {
             setError('请在开始里填写需求描述或上传文件，交给后面的 Agent');
             setState('error');
-            return;
+            return '请在开始里填写需求描述或上传文件，交给后面的 Agent';
           }
         } catch (cause) {
           fail(cause, '需求文件读取失败');
-          return;
+          return cause instanceof Error ? cause.message : '需求文件读取失败';
         }
       }
       if (!mode && runDetail && runDetail.status !== 'pending') {
         setExecutePrompt(true);
-        return;
+        return null;
       }
       setExecutePrompt(false);
     }
-    await act(`run-${action}`, async () => {
+    const succeeded = await act(`run-${action}`, async () => {
       if (action === 'execute') {
         const id = await ensureRun();
         if (mode === 'restart') {
@@ -1278,6 +1334,7 @@ export default function ControlCenter() {
       await request(`/api/workflow-runs/${runId}/${action}`, action === 'replan' ? { reason: replanReason.trim() || 'Human requested replan', definitionJson, resume: true } : {});
       await loadRun(runId); if (workflowId) await loadRuns(workflowId);
     }, action === 'execute' ? (mode === 'resume' ? '已从停下的 Agent 继续' : '已开始执行') : action === 'replan' ? 'Replan 已提交，Run 将自动继续' : `${action} 操作已提交`);
+    return succeeded ? null : (actError.current || '操作没有完成，请查看页面顶部的提示');
   }
   async function sendNodeChat(content: string) {
     const text = content.trim();
@@ -1357,7 +1414,7 @@ export default function ControlCenter() {
       }
       if (acceptance && nodeKey) {
         setLiveChecks((value) => {
-          const next = { ...(value ?? nodeChecks(runDetail?.tasks, runDetail?.events)) };
+          const next = { ...(value ?? nodeChecks(runDetail?.tasks, runDetail?.events, runDetail?.plans)) };
           if (action === 'approve') {
             const previous = next[nodeKey];
             const history = [...(previous?.history ?? [])];
@@ -1624,7 +1681,7 @@ export default function ControlCenter() {
         <div className="run-controls"><button type="submit">创建并打开</button><button type="button" onClick={() => setCreateDialog(null)}>取消</button></div>
       </form>
     </Modal> : null}
-    {board && workflowId ? <WorkflowBoard key={workflowId} mode={board} name={workflowForm.name} version={workflowForm.version} versions={workflowVersions} currentVersionId={currentVersionId} nodes={workflowNodesForm} edges={workflowEdgesForm} loops={workflowLoops} capabilities={capabilities} skills={skills} providers={providers} models={models} events={boardEvents} progress={liveProgress ?? nodeProgress(runDetail?.tasks)} failures={liveFailures ?? nodeFailures(runDetail?.tasks)} checks={liveChecks ?? nodeChecks(runDetail?.tasks, boardEvents)} deliverables={liveDeliverables ?? nodeDeliverables(runDetail?.tasks)} reviewHistories={nodeReviewHistories(runDetail?.tasks)} runStatus={runDetail ? statusText(runDetail.status) : '未运行'} runStatusCode={runDetail?.status} onClose={() => void closeBoard()} onName={(name) => setWorkflowForm({ ...workflowForm, name })} onSelectVersion={(versionId) => void requestVersionSwitch(versionId)} onNodes={setWorkflowNodesForm} onEdges={setWorkflowEdgesForm} onLoops={setWorkflowLoops} onPersist={persistBoard} onPublish={() => void publishWorkflow()} onExecute={() => void runAction('execute')} onStop={stopRun} directory={workflowDirectory} decisions={decisions.filter((item) => item.workflowRunId === runId && item.status !== 'superseded')} decisionNotes={decisionText} onDecisionNote={(id, text) => setDecisionText({ ...decisionText, [id]: text })} onResolveDecision={(id, action, options) => void resolveDecision(id, action, options)} onOpenDirectory={async () => { if (!workflowId) return; try { const opened = await request<{ root: string }>(`/api/workflows/${workflowId}/open`, {}); setWorkflowDirectory(opened.root); setNotice('已在访达中打开主目录'); } catch (cause) { fail(cause, '目录打开失败'); } }} onOpenDeliverable={async (directory) => { if (!workflowId) return; try { await request(`/api/workflows/${workflowId}/open`, { directory }); setNotice('已在访达中打开交付物目录'); } catch (cause) { fail(cause, '目录打开失败'); } }} onLoadSummary={async () => { if (!runId) throw new Error('还没有执行记录'); return request<{ nodes: SummaryNode[] }>(`/api/workflow-runs/${runId}/summary`); }} onReadFile={async (filePath) => { if (!workflowId) throw new Error('请先打开 Workflow'); return request<{ name: string; text?: string; binary?: boolean; path?: string }>(`/api/workflows/${workflowId}/file?path=${encodeURIComponent(filePath)}`); }} onListFiles={() => request<{ directory: string; files: { name: string; size: number }[] }>(`/api/workflows/${workflowId}/files`)} onUploadFile={async (file) => { const response = await fetch(`${API_URL}/api/workflows/${workflowId}/files`, { method: 'POST', headers: { ...authHeaders(), 'x-orvia-filename': encodeURIComponent(file.name) }, body: file }); if (!response.ok) { const data = await response.json().catch(() => ({})) as { error?: string }; throw new Error(data.error ?? '上传失败'); } }} onDeleteFile={(name) => request(`/api/workflows/${workflowId}/files?name=${encodeURIComponent(name)}`, undefined, 'DELETE').then(() => undefined)} chatNode={chatNodeKey ? workflowNodesForm.find((node) => node.key === chatNodeKey) ?? null : null} chatMessages={nodeMessages} chatError={chatError} onOpenChat={(key) => { setChatError(''); setChatNodeKey(key); }} onCloseChat={() => { setChatNodeKey(null); setChatError(''); }} onSendChat={sendNodeChat} onStopChat={stopNodeChat} /> : null}
+    {board && workflowId ? <WorkflowBoard key={workflowId} mode={board} name={workflowForm.name} version={workflowForm.version} versions={workflowVersions} currentVersionId={currentVersionId} nodes={workflowNodesForm} edges={workflowEdgesForm} loops={workflowLoops} capabilities={capabilities} skills={skills} providers={providers} models={models} events={boardEvents} progress={liveProgress ?? nodeProgress(runDetail?.tasks)} failures={liveFailures ?? nodeFailures(runDetail?.tasks)} checks={liveChecks ?? nodeChecks(runDetail?.tasks, boardEvents, runDetail?.plans)} deliverables={liveDeliverables ?? nodeDeliverables(runDetail?.tasks)} reviewHistories={nodeReviewHistories(runDetail?.tasks)} runStatus={runDetail ? statusText(runDetail.status) : '未运行'} runStatusCode={runDetail?.status} onClose={() => void closeBoard()} onName={(name) => setWorkflowForm({ ...workflowForm, name })} onSelectVersion={(versionId) => void requestVersionSwitch(versionId)} onNodes={setWorkflowNodesForm} onEdges={setWorkflowEdgesForm} onLoops={setWorkflowLoops} onPersist={persistBoard} onPublish={() => void publishWorkflow()} onExecute={() => void runAction('execute')} onRunFromStart={() => runAction('execute', 'restart')} onStop={stopRun} directory={workflowDirectory} decisions={decisions.filter((item) => item.workflowRunId === runId && item.status !== 'superseded')} decisionNotes={decisionText} onDecisionNote={(id, text) => setDecisionText({ ...decisionText, [id]: text })} onResolveDecision={(id, action, options) => void resolveDecision(id, action, options)} onOpenDirectory={async () => { if (!workflowId) return; try { const opened = await request<{ root: string }>(`/api/workflows/${workflowId}/open`, {}); setWorkflowDirectory(opened.root); setNotice('已在访达中打开主目录'); } catch (cause) { fail(cause, '目录打开失败'); } }} onOpenDeliverable={async (directory) => { if (!workflowId) return; try { await request(`/api/workflows/${workflowId}/open`, { directory }); setNotice('已在访达中打开交付物目录'); } catch (cause) { fail(cause, '目录打开失败'); } }} onLoadSummary={async () => { if (!runId) throw new Error('还没有执行记录'); return request<{ nodes: SummaryNode[] }>(`/api/workflow-runs/${runId}/summary`); }} onReadFile={async (filePath) => { if (!workflowId) throw new Error('请先打开 Workflow'); return request<{ name: string; text?: string; binary?: boolean; path?: string }>(`/api/workflows/${workflowId}/file?path=${encodeURIComponent(filePath)}`); }} onListFiles={() => request<{ directory: string; files: { name: string; size: number }[] }>(`/api/workflows/${workflowId}/files`)} onUploadFile={async (file) => { const response = await fetch(`${API_URL}/api/workflows/${workflowId}/files`, { method: 'POST', headers: { ...authHeaders(), 'x-orvia-filename': encodeURIComponent(file.name) }, body: file }); if (!response.ok) { const data = await response.json().catch(() => ({})) as { error?: string }; throw new Error(data.error ?? '上传失败'); } }} onDeleteFile={(name) => request(`/api/workflows/${workflowId}/files?name=${encodeURIComponent(name)}`, undefined, 'DELETE').then(() => undefined)} chatNode={chatNodeKey ? workflowNodesForm.find((node) => node.key === chatNodeKey) ?? null : null} chatMessages={nodeMessages} chatError={chatError} onOpenChat={(key) => { setChatError(''); setChatNodeKey(key); }} onCloseChat={() => { setChatNodeKey(null); setChatError(''); }} onSendChat={sendNodeChat} onStopChat={stopNodeChat} workflowId={workflowId} workflowMessages={workflowChatMessages} onRefreshMessages={loadChatMessages} /> : null}
   </div>;
 
   const views: Record<View, React.ReactNode> = { overview, models: modelsView, capabilities: capabilitiesView, skills: skillsView, workflows: workflowsView, settings: settingsView };

@@ -3,17 +3,17 @@ const runTransitions = {
     running: ['paused', 'awaiting_decision', 'completed', 'failed', 'cancelled'],
     paused: ['running', 'cancelled'],
     awaiting_decision: ['running', 'paused', 'failed', 'cancelled'],
-    completed: [],
+    completed: ['running'],
     failed: ['running', 'paused', 'cancelled'],
-    cancelled: [],
+    cancelled: ['running'],
 };
 const taskTransitions = {
     pending: ['blocked', 'running', 'cancelled'],
     blocked: ['pending', 'running', 'cancelled'],
     running: ['pending', 'paused', 'awaiting_decision', 'completed', 'failed', 'cancelled'],
     paused: ['pending', 'running', 'cancelled'],
-    awaiting_decision: ['pending', 'completed', 'failed', 'cancelled'],
-    completed: [],
+    awaiting_decision: ['pending', 'blocked', 'completed', 'failed', 'cancelled'],
+    completed: ['pending'], // 人工退回后上游可重跑
     failed: ['pending', 'cancelled'],
     cancelled: [],
 };

@@ -6,8 +6,8 @@ import { parseTableDefinitions } from '../src/db/ensure-schema.js';
 test('startup table statements are idempotent ov_ creates and can repair missing columns', () => {
   const source = readFileSync(new URL('../src/db/ensure-schema.ts', import.meta.url), 'utf8');
   const names = [...source.matchAll(/CREATE TABLE IF NOT EXISTS (ov_[a-z_]+)/g)].map((match) => match[1]);
-  assert.equal(names.length, 21);
-  assert.equal(new Set(names).size, 21);
+  assert.equal(names.length, 23);
+  assert.equal(new Set(names).size, 23);
   assert.ok(names.includes('ov_workflow_versions'));
   assert.ok(names.includes('ov_projects'));
   assert.ok(names.includes('ov_capabilities'));
@@ -15,6 +15,7 @@ test('startup table statements are idempotent ov_ creates and can repair missing
   assert.ok(names.includes('ov_users'));
   assert.ok(names.includes('ov_tenant_members'));
   assert.ok(names.includes('ov_node_messages'));
+  assert.ok(names.includes('ov_workflow_messages'));
   assert.ok(names.includes('ov_decisions'));
   assert.ok(names.includes('ov_checkpoints'));
   assert.ok(!names.includes('ov_alerts'));

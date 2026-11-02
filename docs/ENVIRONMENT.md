@@ -17,6 +17,8 @@ macOS / Linux 执行 `bash scripts/install-env.sh` 即可安装 Node.js、pnpm�
 
 ## 二、后端变量
 
+把仓库根目录的 `.env.example` 复制为 `.env` 后填写（`scripts/install-env.sh` 会自动完成复制）。
+
 | 变量 | 默认值 | 是否必需 | 用途 |
 |---|---|---|---|
 | `NODE_ENV` | `development` | 否 | 运行环境标识 |
@@ -43,7 +45,7 @@ DATABASE_URL=mysql://用户名:密码@主机:3306/数据库名?charset=utf8mb4&m
 
 ## 三、前端变量
 
-文件位置：`web/.env.local`。
+文件位置：`web/.env.local`，由 `web/.env.example` 复制而来（`scripts/install-env.sh` 会自动完成复制）。该文件不含凭证，已加入 `.gitignore`。
 
 | 变量 | 默认值 | 用途 |
 |---|---|---|
